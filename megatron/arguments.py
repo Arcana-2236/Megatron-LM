@@ -620,6 +620,8 @@ def _add_network_size_args(parser):
                        'This is set to 4*hidden-size if not provided')
     group.add_argument('--mlp-rank', type=int, default=None,
                        help='Bottleneck rank for CoLA MLP projections.')
+    group.add_argument('--attn-rank', type=int, default=None,
+                       help='Bottleneck rank for CoLA self-attention projections.')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--num-key-value-heads', type=int, default=None,

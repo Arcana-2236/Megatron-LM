@@ -192,6 +192,7 @@ class CoLAParallelMLP(MegatronModule):
         rank_hidden, rank_bias = self.cola_h_to_2r(hidden_states)
         if rank_bias is not None:
             rank_hidden = rank_hidden + rank_bias
+        rank_hidden = F.silu(rank_hidden)
         gate_rank, up_rank = torch.chunk(rank_hidden, 2, dim=-1)
 
         gate, gate_bias = self.cola_gate_r_to_dff(gate_rank)
@@ -207,6 +208,7 @@ class CoLAParallelMLP(MegatronModule):
         down_rank, down_rank_bias = self.cola_dff_to_r(intermediate_parallel)
         if down_rank_bias is not None:
             down_rank = down_rank + down_rank_bias
+        down_rank = F.silu(down_rank)
 
         # [s, b, h]
         output, output_bias = self.cola_r_to_h(down_rank)
@@ -534,7 +536,7 @@ class FlashSelfAttentionTriton(torch.nn.Module):
         output = rearrange(output, 'b s h d -> s b (h d)').contiguous()
         return output
 
-class ParallelAttention(MegatronModule):
+class CoLAParallelAttention(MegatronModule):
     """Parallel self-attention layer abstract class.
 
     Self-attention layer takes input with size [s, b, h]
@@ -544,7 +546,7 @@ class ParallelAttention(MegatronModule):
     def __init__(self, config, layer_number,
                  attention_type=AttnType.self_attn,
                  attn_mask_type=AttnMaskType.padding):
-        super(ParallelAttention, self).__init__()
+        super(CoLAParallelAttention, self).__init__()
         args = get_args()
         self.layer_number = max(1, layer_number)
         self.attention_type = attention_type
@@ -605,15 +607,44 @@ class ParallelAttention(MegatronModule):
         self.kv_projection_size = kv_projection_size
         self.head_dim = config.kv_channels
 
-        # Strided linear layer.
+        # Strided linear layers.
         if attention_type == AttnType.self_attn:
-            self.query_key_value = tensor_parallel.ColumnParallelLinear(
+            # CoLA factorization for self-attention projections:
+            # 1) hidden_size -> 3 * attn_rank
+            # 2) split into q/k/v rank features
+            # 3) q: attn_rank -> projection_size, k/v: attn_rank -> kv_projection_size
+            self.cola_d_to_3r = tensor_parallel.ColumnParallelLinear(
                 config.hidden_size,
-                projection_size + 2 * kv_projection_size,
+                3 * config.attn_rank,
                 config=config,
                 init_method=config.init_method,
                 bias=args.add_bias_linear,
-                gather_output=False)
+                gather_output=True,
+                skip_bias_add=True)
+            self.cola_q_r_to_proj = tensor_parallel.ColumnParallelLinear(
+                config.attn_rank,
+                projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=args.add_bias_linear,
+                gather_output=False,
+                skip_bias_add=True)
+            self.cola_k_r_to_kv = tensor_parallel.ColumnParallelLinear(
+                config.attn_rank,
+                kv_projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=args.add_bias_linear,
+                gather_output=False,
+                skip_bias_add=True)
+            self.cola_v_r_to_kv = tensor_parallel.ColumnParallelLinear(
+                config.attn_rank,
+                kv_projection_size,
+                config=config,
+                init_method=config.init_method,
+                bias=args.add_bias_linear,
+                gather_output=False,
+                skip_bias_add=True)
         else:
             assert attention_type == AttnType.cross_attn
             self.query = tensor_parallel.ColumnParallelLinear(
@@ -658,15 +689,25 @@ class ParallelAttention(MegatronModule):
                 self.core_attention = local_attn
                 self.checkpoint_core_attention = config.recompute_granularity == 'selective'
 
-        # Output.
-        self.dense = tensor_parallel.RowParallelLinear(
+        # CoLA factorization for attention output projection:
+        # 1) hidden_size -> attn_rank
+        # 2) attn_rank -> hidden_size
+        self.cola_out_d_to_r = tensor_parallel.RowParallelLinear(
             projection_size,
-            config.hidden_size,
+            config.attn_rank,
             config=config,
             init_method=config.output_layer_init_method,
             bias=args.add_bias_linear,
             input_is_parallel=True,
             skip_bias_add=True)
+        self.cola_out_r_to_d = tensor_parallel.ColumnParallelLinear(
+            config.attn_rank,
+            config.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=args.add_bias_linear,
+            gather_output=True,
+            skip_bias_add=False)
 
 
     def _checkpointed_attention_forward(self, query_layer, key_layer,
@@ -752,8 +793,26 @@ class ParallelAttention(MegatronModule):
         # Query, Key, and Value
         # =====================
         if self.attention_type == AttnType.self_attn:
-            # Attention heads [sq, b, h] --> [sq, b, ((nq + 2 * nkv) * hn)]
-            mixed_x_layer, _ = self.query_key_value(hidden_states)
+            # CoLA attention projections:
+            # [sq, b, h] -> [sq, b, 3r] -> q/k/v rank tensors -> partitioned q/k/v projections.
+            qkv_rank, qkv_rank_bias = self.cola_d_to_3r(hidden_states)
+            if qkv_rank_bias is not None:
+                qkv_rank = qkv_rank + qkv_rank_bias
+            qkv_rank = F.silu(qkv_rank)
+            q_rank, k_rank, v_rank = torch.chunk(qkv_rank, 3, dim=-1)
+
+            query_proj, query_bias = self.cola_q_r_to_proj(q_rank)
+            key_proj, key_bias = self.cola_k_r_to_kv(k_rank)
+            value_proj, value_bias = self.cola_v_r_to_kv(v_rank)
+            if query_bias is not None:
+                query_proj = query_proj + query_bias
+            if key_bias is not None:
+                key_proj = key_proj + key_bias
+            if value_bias is not None:
+                value_proj = value_proj + value_bias
+
+            # Keep the same packed representation expected by downstream reshape/split logic.
+            mixed_x_layer = torch.cat((query_proj, key_proj, value_proj), dim=-1)
             
             if self.enable_ds_sequence_parallel:
                 assert self.projection_size == self.kv_projection_size
@@ -913,7 +972,11 @@ class ParallelAttention(MegatronModule):
         # Output. [sq, b, h]
         # =================
 
-        output, bias = self.dense(context_layer)
+        down_rank, down_rank_bias = self.cola_out_d_to_r(context_layer)
+        if down_rank_bias is not None:
+            down_rank = down_rank + down_rank_bias
+        down_rank = F.silu(down_rank)
+        output, bias = self.cola_out_r_to_d(down_rank)
 
         return output, bias
 
@@ -1048,7 +1111,7 @@ class ParallelTransformerLayer(MegatronModule):
         if args.ds_sequence_parallel_fpdt:            
             self.self_attention = launch_chunk_attention(args, config)
         else:
-            self.self_attention = ParallelAttention(
+            self.self_attention = CoLAParallelAttention(
                 config,
                 layer_number,
                 attention_type=AttnType.self_attn,
@@ -1080,7 +1143,7 @@ class ParallelTransformerLayer(MegatronModule):
                                LayerType.retro_decoder,
                                LayerType.retro_decoder_with_retriever,
                                LayerType.retro_encoder):
-            self.inter_attention = ParallelAttention(
+            self.inter_attention = CoLAParallelAttention(
                 config,
                 layer_number,
                 attention_type=AttnType.cross_attn)
