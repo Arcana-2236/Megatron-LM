@@ -35,9 +35,10 @@ class RotaryEmbedding(nn.Module):
         emb = torch.cat((freqs, freqs), dim=-1)
         # emb [seq_length, .., dim]
         from einops import rearrange
-        base = rearrange(emb, 'n d -> n 1 1 d')
-        rope = [base.cos(), base.sin()]
-        return rope
+        # base = rearrange(emb, 'n d -> n 1 1 d')
+        # rope = [base.cos(), base.sin()]
+        # return rope
+        return rearrange(emb, 'n d -> n 1 1 d')
 
 
 def _rotate_half(x):

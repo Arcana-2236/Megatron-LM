@@ -12,7 +12,8 @@ from megatron import get_tokenizer
 from megatron.core import mpu, tensor_parallel
 from megatron.core.enums import ModelType
 from megatron.data.gpt_dataset import build_train_valid_test_datasets
-from megatron.model import GPTModel, GPTModelPipe
+from megatron.model import gpt_model as baseline_gpt_model
+from megatron.model import cola_gpt_model
 from megatron.training import pretrain
 from megatron.utils import get_ltor_masks_and_position_ids
 from megatron.utils import average_losses_across_data_parallel_group, update_rotary_pos_emb
@@ -32,10 +33,16 @@ import torch.nn.functional as F
 def model_provider(pre_process=True, post_process=True):
     """Build the model."""
 
-    print_rank_0('building GPT model ...')
+    args = get_args()
+    model_module = baseline_gpt_model
+    if args.model_impl == 'cola':
+        model_module = cola_gpt_model
+    elif args.model_impl != 'baseline':
+        raise ValueError(f"Unsupported model-impl '{args.model_impl}'. Expected one of: baseline, cola.")
+
+    print_rank_0(f"building GPT model (model_impl={args.model_impl}) ...")
     see_memory_usage(f"Before Building Model", force=True)
 
-    args = get_args()
     config = core_transformer_config_from_args(args)
     if hasattr(mpu, 'get_sequence_data_parallel_group'):
         dpg = mpu.get_sequence_data_parallel_group()
@@ -49,7 +56,7 @@ def model_provider(pre_process=True, post_process=True):
                              enabled=args.zero_stage == 3,
                              mpu=mpu):
         if args.deepspeed and not args.no_pipeline_parallel:
-            model = GPTModelPipe(
+            model = model_module.GPTModelPipe(
                 config=config,
                 num_tokentypes=0,
                 parallel_output=True
@@ -80,7 +87,7 @@ def model_provider(pre_process=True, post_process=True):
                 update_rotary_pos_emb(args.seq_length)
 
         else:
-            model = GPTModel(
+            model = model_module.GPTModel(
                 config=config,
                 num_tokentypes=0,
                 parallel_output=True,
