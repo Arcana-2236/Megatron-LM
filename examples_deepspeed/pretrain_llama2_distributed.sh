@@ -14,10 +14,10 @@ CHECKPOINT_PATH=./tmp
 
 TP=1
 PP=1
-ZERO_STAGE=1
-MODEL_IMPL=baseline  # baseline | cola
+ZERO_STAGE=0
+MODEL_IMPL=cola  # baseline | cola
 
-GPUS_PER_NODE=4
+GPUS_PER_NODE=1
 MASTER_ADDR=localhost
 MASTER_PORT=6000
 NNODES=1
@@ -26,13 +26,14 @@ NODE_RANK=0
 # llama-1B
 HIDDEN_SIZE=2048 # e.g. llama-13b: 5120
 FFN_HIDDEN_SIZE=5504 # e.g. llama-13b: 13824
+MLP_RANK=512 # CoLA bottleneck rank
 NUM_LAYERS=24 # e.g. llama-13b: 40
 NUM_HEADS=32 # e.g. llama-13b: 40
 SEQ_LENGTH=1024
 NUM_KV_HEADS=32 # llama2 70B uses GQA
 
-MICRO_BATCH_SIZE=8
-GLOBAL_BATCH_SIZE=32 # e.g. llama: 4M tokens
+MICRO_BATCH_SIZE=1
+GLOBAL_BATCH_SIZE=4 # e.g. llama: 4M tokens
 # TRAIN_STEPS=250000 # e.g. llama: 1T tokens / 4M tokens_per_batch = 250000 steps
 TRAIN_STEPS=10
 LR=3e-4
@@ -44,7 +45,7 @@ GRAD_CLIP=1
 
 ## Activation checkpointing saves GPU memory, but reduces training speed
 # activation_checkpoint="true"
-activation_checkpoint="true"
+activation_checkpoint="false"
 
 LOG_TO_WANDB=0
 WANDB_ARGS=
@@ -69,27 +70,41 @@ fi
 ######################################
 
 
+# cat <<EOT > $DS_CONFIG
+# {
+#   "train_batch_size" : $GLOBAL_BATCH_SIZE,
+#   "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
+#   "steps_per_print": 1,
+#   "zero_optimization": {
+#     "stage": $ZERO_STAGE,
+#     "offload_optimizer": {
+#       "device": "cpu"
+#     }
+#   },
+#   "bf16": {
+#     "enabled": true
+#   },
+#   "flops_profiler": {
+#     "enabled": true,
+#     "profile_step": 5,
+#     "module_depth": 2,
+#     "top_modules": 10,
+#     "detailed": true,
+#     "output_file": "${BASE_PATH}/.logging/0401/ds_flops_profile_rank${NODE_RANK}.txt"
+#   }
+# }
+# EOT
+
 cat <<EOT > $DS_CONFIG
 {
   "train_batch_size" : $GLOBAL_BATCH_SIZE,
   "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
   "steps_per_print": 1,
   "zero_optimization": {
-    "stage": $ZERO_STAGE,
-    "offload_optimizer": {
-      "device": "cpu"
-    }
+    "stage": $ZERO_STAGE
   },
   "bf16": {
     "enabled": true
-  },
-  "flops_profiler": {
-    "enabled": true,
-    "profile_step": 5,
-    "module_depth": 2,
-    "top_modules": 10,
-    "detailed": true,
-    "output_file": "${BASE_PATH}/.logging/0401/ds_flops_profile_rank${NODE_RANK}.txt"
   }
 }
 EOT
@@ -171,12 +186,12 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --model-impl $MODEL_IMPL \
-       --cpu-optimizer \
        --tensor-model-parallel-size $TP \
        --pipeline-model-parallel-size $PP \
        --num-layers $NUM_LAYERS \
        --hidden-size $HIDDEN_SIZE \
        --ffn-hidden-size $FFN_HIDDEN_SIZE \
+       --mlp-rank $MLP_RANK \
        --num-attention-heads $NUM_HEADS \
        --micro-batch-size $MICRO_BATCH_SIZE \
        --global-batch-size $GLOBAL_BATCH_SIZE \

@@ -95,7 +95,7 @@ class DropPath(MegatronModule):
         output = hidden_state.div(keep_prob) * random_tensor
         return output
 
-class ParallelMLP(MegatronModule):
+class CoLAParallelMLP(MegatronModule):
     """MLP.
 
     MLP will take the input with h hidden state, project it to 4*h
@@ -104,19 +104,48 @@ class ParallelMLP(MegatronModule):
     """
 
     def __init__(self, config, moe=False, enable_expert_tensor_parallelism=False):
-        super(ParallelMLP, self).__init__()
+        super(CoLAParallelMLP, self).__init__()
         args = get_args()
+        if not args.swiglu:
+            raise ValueError("CoLAParallelMLP currently supports llama-style SwiGLU only (set --swiglu).")
+        if args.openai_gelu or args.onnx_safe or args.squared_relu or args.bias_gelu_fusion:
+            raise ValueError(
+                "CoLAParallelMLP does not support openai_gelu/onnx_safe/squared_relu/bias_gelu_fusion paths."
+            )
+        if not config.gated_linear_unit:
+            raise ValueError("CoLAParallelMLP expects gated_linear_unit=True for SwiGLU.")
 
         self.add_bias = config.add_bias_linear
 
-        ffn_hidden_size = config.ffn_hidden_size
-        if config.gated_linear_unit:
-            ffn_hidden_size *= 2
-
-        # Project to 4h. If using swiglu double the output width, see https://arxiv.org/pdf/2002.05202.pdf
-        self.dense_h_to_4h = tensor_parallel.ColumnParallelLinear(
+        # CoLA factorization for llama MLP up+gate path:
+        # 1) hidden_size -> 2 * mlp_rank
+        # 2) split into gate/up rank features
+        # 3) gate: mlp_rank -> ffn_hidden_size, up: mlp_rank -> ffn_hidden_size
+        self.cola_h_to_2r = tensor_parallel.ColumnParallelLinear(
             config.hidden_size,
-            ffn_hidden_size,
+            2 * config.mlp_rank,
+            config=config,
+            init_method=config.init_method,
+            bias=self.add_bias,
+            gather_output=True,
+            skip_bias_add=True,
+            moe=moe,
+            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+        )
+        self.cola_gate_r_to_dff = tensor_parallel.ColumnParallelLinear(
+            config.mlp_rank,
+            config.ffn_hidden_size,
+            config=config,
+            init_method=config.init_method,
+            bias=self.add_bias,
+            gather_output=False,
+            skip_bias_add=True,
+            moe=moe,
+            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+        )
+        self.cola_up_r_to_dff = tensor_parallel.ColumnParallelLinear(
+            config.mlp_rank,
+            config.ffn_hidden_size,
             config=config,
             init_method=config.init_method,
             bias=self.add_bias,
@@ -126,31 +155,12 @@ class ParallelMLP(MegatronModule):
             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
 
-        self.bias_gelu_fusion = False
-        self.activation_func = None
-        self.swiglu = args.swiglu
-
-        if args.openai_gelu:
-            self.activation_func = openai_gelu
-        elif args.onnx_safe:
-            self.activation_func = erf_gelu
-        elif args.swiglu:
-            def swiglu(x):
-                x = torch.chunk(x, 2, dim=-1)
-                return F.silu(x[0]) * x[1]
-            self.activation_func = swiglu
-        elif args.squared_relu:
-            def squared_relu(x):
-                return torch.pow(F.relu(x), 2)
-            self.activation_func = squared_relu
-        else:
-            self.bias_gelu_fusion = args.bias_gelu_fusion
-            self.activation_func = F.gelu
-
-        # Project back to h.
-        self.dense_4h_to_h = tensor_parallel.RowParallelLinear(
+        # CoLA factorization for llama MLP down path:
+        # 1) ffn_hidden_size -> mlp_rank
+        # 2) mlp_rank -> hidden_size
+        self.cola_dff_to_r = tensor_parallel.RowParallelLinear(
             config.ffn_hidden_size,
-            config.hidden_size,
+            config.mlp_rank,
             config=config,
             init_method=config.output_layer_init_method,
             bias=self.add_bias,
@@ -158,31 +168,51 @@ class ParallelMLP(MegatronModule):
             moe=moe,
             enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
         )
+        self.cola_r_to_h = tensor_parallel.ColumnParallelLinear(
+            config.mlp_rank,
+            config.hidden_size,
+            config=config,
+            init_method=config.output_layer_init_method,
+            bias=self.add_bias,
+            gather_output=True,
+            skip_bias_add=True,
+            moe=moe,
+            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism
+        )
+        if config.sequence_parallel:
+            raise NotImplementedError(
+                "CoLAParallelMLP down factorization currently does not support sequence_parallel=True."
+            )
         
         self.ds_sequence_parallel_fpdt = args.ds_sequence_parallel_fpdt
         if self.ds_sequence_parallel_fpdt:
-            self.fpdt_FFN_chunk_size = int(args.ds_sequence_parallel_fpdt_chunk_size // mpu.get_sequence_parallel_world_size() // 2)
+            raise NotImplementedError("CoLAParallelMLP does not currently support ds_sequence_parallel_fpdt.")
 
     def forward(self, hidden_states):
+        rank_hidden, rank_bias = self.cola_h_to_2r(hidden_states)
+        if rank_bias is not None:
+            rank_hidden = rank_hidden + rank_bias
+        gate_rank, up_rank = torch.chunk(rank_hidden, 2, dim=-1)
 
-        if self.ds_sequence_parallel_fpdt:
-            output, output_bias = FPDT_FFN.apply(hidden_states, self.dense_h_to_4h.weight, self.dense_h_to_4h.bias, self.dense_4h_to_h.weight, self.dense_4h_to_h.bias, self.add_bias, self.fpdt_FFN_chunk_size)
-        else:
-            # [s, b, 4hp]
-            intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
+        gate, gate_bias = self.cola_gate_r_to_dff(gate_rank)
+        up, up_bias = self.cola_up_r_to_dff(up_rank)
+        if gate_bias is not None:
+            gate = gate + gate_bias
+        if up_bias is not None:
+            up = up + up_bias
 
-            if self.bias_gelu_fusion:
-                assert self.add_bias is True
-                # DeepSpeed FLOPS profiler temporarily substitues functions like F.gelu to calculate the throughput
-                assert hasattr(self, "__flops__") or self.activation_func == F.gelu
-                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            else:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
+        intermediate_parallel = F.silu(gate) * up
 
-            # [s, b, h]
-            output, output_bias = self.dense_4h_to_h(intermediate_parallel)
+        # [s, b, r]
+        down_rank, down_rank_bias = self.cola_dff_to_r(intermediate_parallel)
+        if down_rank_bias is not None:
+            down_rank = down_rank + down_rank_bias
+
+        # [s, b, h]
+        output, output_bias = self.cola_r_to_h(down_rank)
+        if output_bias is not None:
+            output = output + output_bias
+            output_bias = None
         return output, output_bias
 
 class SwitchMLP(MegatronModule):
@@ -195,7 +225,7 @@ class SwitchMLP(MegatronModule):
         self.router = torch.nn.Linear(config.hidden_size, args.num_experts_switch)
         self.experts = torch.nn.ModuleList()
         for i in range(args.num_experts_switch):
-            self.experts.append(ParallelMLP(config))
+            self.experts.append(CoLAParallelMLP(config))
 
     def forward(self, hidden_states):
         # hidden_states: [s, b, h]
@@ -1074,11 +1104,11 @@ class ParallelTransformerLayer(MegatronModule):
             self.mlp = SwitchMLP(config) # Megatron-LM's MoE
         else:
             if self.num_experts <= 1: # dense, not MoE
-                self.mlp = ParallelMLP(config)
+                self.mlp = CoLAParallelMLP(config)
             else: # DeepSpeed's MoE
                 enable_expert_tensor_parallelism = args.enable_expert_tensor_parallelism
                 self.mlp = MoE(args.hidden_size,
-                               ParallelMLP(config,
+                               CoLAParallelMLP(config,
                                            moe=True,
                                            enable_expert_tensor_parallelism=enable_expert_tensor_parallelism),
                                num_experts=self.num_experts,

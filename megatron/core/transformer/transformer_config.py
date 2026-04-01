@@ -109,6 +109,7 @@ class TransformerConfig(ModelParallelConfig):
     num_key_value_heads: int = None
 
     ffn_hidden_size: int = None
+    mlp_rank: int = None
     kv_channels: int = None
     hidden_dropout: float = 0.1
     attention_dropout: float = 0.1
@@ -154,6 +155,8 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.ffn_hidden_size is None:
             self.ffn_hidden_size = 4 * self.hidden_size
+        if self.mlp_rank is None:
+            self.mlp_rank = self.hidden_size // 4
 
         if self.num_key_value_heads is None:
             self.num_key_value_heads = self.num_attention_heads
@@ -211,4 +214,3 @@ class TransformerConfig(ModelParallelConfig):
 
         if self.output_layer_init_method is None:
             self.output_layer_init_method = scaled_init_method_normal(self.init_method_std, self.num_layers)
-

@@ -618,6 +618,8 @@ def _add_network_size_args(parser):
     group.add_argument('--ffn-hidden-size', type=int, default=None,
                        help='Transformer Feed-Forward Network hidden size. '
                        'This is set to 4*hidden-size if not provided')
+    group.add_argument('--mlp-rank', type=int, default=None,
+                       help='Bottleneck rank for CoLA MLP projections.')
     group.add_argument('--num-attention-heads', type=int, default=None,
                        help='Number of transformer attention heads.')
     group.add_argument('--num-key-value-heads', type=int, default=None,
