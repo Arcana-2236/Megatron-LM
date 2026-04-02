@@ -15,7 +15,7 @@ CHECKPOINT_PATH=./tmp
 TP=1
 PP=1
 ZERO_STAGE=0
-MODEL_IMPL=cola  # baseline | cola
+MODEL_IMPL=baseline  # baseline | cola
 
 GPUS_PER_NODE=1
 MASTER_ADDR=localhost
@@ -129,6 +129,33 @@ fi
 
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
+ENABLE_NSYS=${ENABLE_NSYS:-0}
+NSYS_TS=$(date +%Y%m%d_%H%M%S)
+NSYS_OUT=${NSYS_OUT:-.logging/0402/llama1b_${MODEL_IMPL}_${NSYS_TS}}
+NSYS_PROFILE_START_STEP=${NSYS_PROFILE_START_STEP:-4}
+NSYS_PROFILE_END_STEP=${NSYS_PROFILE_END_STEP:-8}
+
+
+LAUNCH_PREFIX=()
+if [ "$ENABLE_NSYS" = "1" ]; then
+  if [ "$NSYS_PROFILE_END_STEP" -lt "$NSYS_PROFILE_START_STEP" ]; then
+    echo "NSYS_PROFILE_END_STEP must be >= NSYS_PROFILE_START_STEP"
+    exit 1
+  fi
+
+  # training.py reads these env vars for cudaProfilerStart/Stop
+  export NSYS_PROFILE_START_STEP NSYS_PROFILE_END_STEP
+
+  LAUNCH_PREFIX=(
+    nsys profile -w true
+    -t cuda,nvtx,osrt,cudnn,cublas
+    --capture-range=cudaProfilerApi
+    -x true
+    --stats=true
+    -o "$NSYS_OUT"
+  )
+fi
+
 # torchrun $DISTRIBUTED_ARGS \
 #        pretrain_gpt.py \
 #        --tensor-model-parallel-size $TP \
@@ -183,7 +210,7 @@ DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $
 
       #  --cpu-optimizer \
 
-torchrun $DISTRIBUTED_ARGS \
+"${LAUNCH_PREFIX[@]}" torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --model-impl $MODEL_IMPL \
        --tensor-model-parallel-size $TP \

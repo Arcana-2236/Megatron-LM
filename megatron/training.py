@@ -5,6 +5,7 @@
 
 from datetime import datetime
 import math
+import os
 import sys
 import time
 import json
@@ -1245,11 +1246,32 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
     if args.random_ltd:
         assert model[0].random_ltd_enabled()
         args.random_ltd_layer_num = model[0].random_ltd_scheduler.get_random_ltd_layer_num()
+
+    # Optional Nsight Systems capture window (iteration-based), controlled by:
+    #   NSYS_PROFILE_START_STEP=<int>
+    #   NSYS_PROFILE_END_STEP=<int>
+    nsys_profile_start_step = int(os.getenv("NSYS_PROFILE_START_STEP", "-1"))
+    nsys_profile_end_step = int(os.getenv("NSYS_PROFILE_END_STEP", "-1"))
+    nsys_profile_enabled = (
+        get_accelerator().device_name() == 'cuda'
+        and nsys_profile_start_step >= 0
+        and nsys_profile_end_step >= nsys_profile_start_step
+    )
+    nsys_profile_started = False
         
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
         trigger(on_step_begin)
         update_num_microbatches(args.consumed_train_samples)
+
+        if nsys_profile_enabled and (not nsys_profile_started) and iteration == nsys_profile_start_step:
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStart()
+            nsys_profile_started = True
+            print_rank_0(f"[nsys] cudaProfilerStart at iteration {iteration}")
+
         if args.deepspeed:
             # inform deepspeed of any batch size changes
             global_batch_size = mpu.get_data_parallel_world_size() * \
@@ -1265,15 +1287,32 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
-        loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
-            train_step(forward_step_func,
-                       train_data_iterator,
-                       model,
-                       optimizer,
-                       opt_param_scheduler,
-                       config)
+        iter_nvtx_pushed = False
+        if get_accelerator().device_name() == 'cuda':
+            torch.cuda.nvtx.range_push(f"train_iter_{iteration}")
+            iter_nvtx_pushed = True
+        try:
+            loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
+                train_step(forward_step_func,
+                           train_data_iterator,
+                           model,
+                           optimizer,
+                           opt_param_scheduler,
+                           config)
+        finally:
+            if iter_nvtx_pushed:
+                torch.cuda.nvtx.range_pop()
         iteration += 1
         args.iteration = iteration
+
+        if nsys_profile_enabled and nsys_profile_started and iteration == (nsys_profile_end_step + 1):
+            torch.cuda.synchronize()
+            torch.cuda.cudart().cudaProfilerStop()
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
+            nsys_profile_started = False
+            print_rank_0(f"[nsys] cudaProfilerStop at iteration {iteration - 1}")
+
         new_samples = mpu.get_data_parallel_world_size() * \
                                        args.micro_batch_size * \
                                        get_num_microbatches()
@@ -1380,6 +1419,13 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
             print_datetime(f"Detected kill switch at {args.kill_switch_file}, "
                            f"iteration={iteration}. Exiting")
             sys.exit()
+
+    if nsys_profile_started:
+        torch.cuda.synchronize()
+        torch.cuda.cudart().cudaProfilerStop()
+        if torch.distributed.is_initialized():
+            torch.distributed.barrier()
+        print_rank_0(f"[nsys] cudaProfilerStop at loop end iteration {iteration}")
 
     return iteration
 

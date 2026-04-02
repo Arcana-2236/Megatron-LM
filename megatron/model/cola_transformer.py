@@ -189,6 +189,7 @@ class CoLAParallelMLP(MegatronModule):
             raise NotImplementedError("CoLAParallelMLP does not currently support ds_sequence_parallel_fpdt.")
 
     def forward(self, hidden_states):
+        torch.cuda.nvtx.range_push("cola_mlp_up_proj")
         rank_hidden, rank_bias = self.cola_h_to_2r(hidden_states)
         if rank_bias is not None:
             rank_hidden = rank_hidden + rank_bias
@@ -203,7 +204,9 @@ class CoLAParallelMLP(MegatronModule):
             up = up + up_bias
 
         intermediate_parallel = F.silu(gate) * up
+        torch.cuda.nvtx.range_pop()
 
+        torch.cuda.nvtx.range_push("cola_mlp_down_proj")
         # [s, b, r]
         down_rank, down_rank_bias = self.cola_dff_to_r(intermediate_parallel)
         if down_rank_bias is not None:
@@ -212,6 +215,7 @@ class CoLAParallelMLP(MegatronModule):
 
         # [s, b, h]
         output, output_bias = self.cola_r_to_h(down_rank)
+        torch.cuda.nvtx.range_pop()
         if output_bias is not None:
             output = output + output_bias
             output_bias = None
@@ -793,6 +797,7 @@ class CoLAParallelAttention(MegatronModule):
         # Query, Key, and Value
         # =====================
         if self.attention_type == AttnType.self_attn:
+            torch.cuda.nvtx.range_push("cola_attn_qkv_proj")
             # CoLA attention projections:
             # [sq, b, h] -> [sq, b, 3r] -> q/k/v rank tensors -> partitioned q/k/v projections.
             qkv_rank, qkv_rank_bias = self.cola_d_to_3r(hidden_states)
@@ -843,6 +848,7 @@ class CoLAParallelAttention(MegatronModule):
                 key_layer = self.repeat_kv(key_layer, self.num_key_value_groups)
                 value_layer = self.repeat_kv(value_layer,
                                              self.num_key_value_groups)
+            torch.cuda.nvtx.range_pop()
         else:
             assert not self.use_gqa, 'GQA + cross-attn not tested yet'
 
@@ -932,6 +938,7 @@ class CoLAParallelAttention(MegatronModule):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
+        torch.cuda.nvtx.range_push("cola_attn_core")
         if self.enable_ds_sequence_parallel:
             batch_dim_idx = 1
             if self.use_flash_attn:
@@ -967,16 +974,19 @@ class CoLAParallelAttention(MegatronModule):
                 else:
                     context_layer = self.core_attention(
                         query_layer, key_layer, value_layer, attention_mask)
+        torch.cuda.nvtx.range_pop()
 
         # =================
         # Output. [sq, b, h]
         # =================
 
+        torch.cuda.nvtx.range_push("cola_attn_out_proj")
         down_rank, down_rank_bias = self.cola_out_d_to_r(context_layer)
         if down_rank_bias is not None:
             down_rank = down_rank + down_rank_bias
         down_rank = F.silu(down_rank)
         output, bias = self.cola_out_r_to_d(down_rank)
+        torch.cuda.nvtx.range_pop()
 
         return output, bias
 
@@ -1429,160 +1439,168 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=None,
                 rotary_pos_emb=None,
                 aggregated_moe_loss=None):
-        # hidden_states: [s, b, h]
+        layer_nvtx_pushed = False
+        if hidden_states.is_cuda:
+            torch.cuda.nvtx.range_push(f"layer_{self.layer_number - 1}")
+            layer_nvtx_pushed = True
+        try:
+            # hidden_states: [s, b, h]
 
-        # Layer norm at the beginning of the transformer layer.
-        layernorm_output = self.input_layernorm(hidden_states)
+            # Layer norm at the beginning of the transformer layer.
+            layernorm_output = self.input_layernorm(hidden_states)
 
-        # Self attention.
-        if self.ds_sequence_parallel_fpdt_offloading:
-            attention_output, attention_bias = \
-                self.self_attention(
-                    layernorm_output,
-                    attention_mask,
-                    inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb,
-                    cpu_offloading=self.ds_sequence_parallel_fpdt_offloading)
-        else:
-            attention_output, attention_bias = \
-                self.self_attention(
-                    layernorm_output,
-                    attention_mask,
-                    inference_params=inference_params,
-                    rotary_pos_emb=rotary_pos_emb)
-            
-        # Residual connection.
-        if self.apply_residual_connection_post_layernorm:
-            residual = layernorm_output
-        else:
-            residual = hidden_states
-
-        # FPDT does not support dropout yet.
-        if not self.ds_sequence_parallel_fpdt:
-            if self.drop_path is None:
-                # jit scripting for a nn.module (with dropout) is not
-                # trigerring the fusion kernel. For now, we use two
-                # different nn.functional routines to account for varying
-                # dropout semantics during training and inference phases.
-                if self.bias_dropout_fusion:
-                    if self.training:
-                        bias_dropout_add_func = bias_dropout_add_fused_train
-                    else:
-                        bias_dropout_add_func = bias_dropout_add_fused_inference
-                else:
-                    bias_dropout_add_func = get_bias_dropout_add(self.training)
-
-                if attention_bias is not None:
-                    attention_bias = attention_bias.expand_as(residual)
-                with self.bias_dropout_add_exec_handler():
-                    layernorm_input = bias_dropout_add_func(
-                        attention_output,
-                        attention_bias,
-                        residual,
-                        self.hidden_dropout)
+            # Self attention.
+            if self.ds_sequence_parallel_fpdt_offloading:
+                attention_output, attention_bias = \
+                    self.self_attention(
+                        layernorm_output,
+                        attention_mask,
+                        inference_params=inference_params,
+                        rotary_pos_emb=rotary_pos_emb,
+                        cpu_offloading=self.ds_sequence_parallel_fpdt_offloading)
             else:
-                out = torch.nn.functional.dropout(attention_output + attention_bias,
-                                                p=self.hidden_dropout,
-                                                training=self.training)
-                layernorm_input = residual + self.drop_path(out)
-        else:
-            if attention_bias is not None:
-                attention_output = attention_output + attention_bias
-            layernorm_input = attention_output + residual
+                attention_output, attention_bias = \
+                    self.self_attention(
+                        layernorm_output,
+                        attention_mask,
+                        inference_params=inference_params,
+                        rotary_pos_emb=rotary_pos_emb)
+                
+            # Residual connection.
+            if self.apply_residual_connection_post_layernorm:
+                residual = layernorm_output
+            else:
+                residual = hidden_states
 
-        # Layer norm post the self attention.
-        layernorm_output = self.post_attention_layernorm(layernorm_input)
+            # FPDT does not support dropout yet.
+            if not self.ds_sequence_parallel_fpdt:
+                if self.drop_path is None:
+                    # jit scripting for a nn.module (with dropout) is not
+                    # trigerring the fusion kernel. For now, we use two
+                    # different nn.functional routines to account for varying
+                    # dropout semantics during training and inference phases.
+                    if self.bias_dropout_fusion:
+                        if self.training:
+                            bias_dropout_add_func = bias_dropout_add_fused_train
+                        else:
+                            bias_dropout_add_func = bias_dropout_add_fused_inference
+                    else:
+                        bias_dropout_add_func = get_bias_dropout_add(self.training)
 
-        # Cross attention.
-        if self.layer_type == LayerType.encoder:
-            pass
-        elif self.layer_type == LayerType.decoder:
-            layernorm_input, layernorm_output = \
-                self.default_decoder_cross_attention(
-                    encoder_output,
-                    enc_dec_attn_mask,
-                    layernorm_input,
-                    layernorm_output,
-                    bias_dropout_add_func)
-        elif self.layer_type == LayerType.retro_encoder:
-            layernorm_input, layernorm_output = \
-                self.retro_encoder_cross_attention(
-                    retriever_output,
-                    layernorm_input,
-                    layernorm_output,
-                    bias_dropout_add_func)
-        elif self.layer_type in (LayerType.retro_decoder,
-                                 LayerType.retro_decoder_with_retriever):
-            retriever_output, layernorm_input, layernorm_output = \
-                self.retro_decoder_cross_attention(
-                    retriever_input,
-                    retriever_output,
-                    retriever_attn_mask,
-                    layernorm_input,
-                    layernorm_output,
-                    inference_params,
-                    bias_dropout_add_func)
-        else:
-            raise Exception("Unsupported layer type, '%s'." %
-                            self.layer_type.name)
+                    if attention_bias is not None:
+                        attention_bias = attention_bias.expand_as(residual)
+                    with self.bias_dropout_add_exec_handler():
+                        layernorm_input = bias_dropout_add_func(
+                            attention_output,
+                            attention_bias,
+                            residual,
+                            self.hidden_dropout)
+                else:
+                    out = torch.nn.functional.dropout(attention_output + attention_bias,
+                                                    p=self.hidden_dropout,
+                                                    training=self.training)
+                    layernorm_input = residual + self.drop_path(out)
+            else:
+                if attention_bias is not None:
+                    attention_output = attention_output + attention_bias
+                layernorm_input = attention_output + residual
 
-        # MLP.
-        moe_loss = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
-        mlp_bias = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
+            # Layer norm post the self attention.
+            layernorm_output = self.post_attention_layernorm(layernorm_input)
 
-        if self.num_experts == 1:
-            mlp_output, mlp_bias = self.mlp(layernorm_output)
-        else:
-            mlp_output, moe_loss, _ = self.mlp(layernorm_output)
+            # Cross attention.
+            if self.layer_type == LayerType.encoder:
+                pass
+            elif self.layer_type == LayerType.decoder:
+                layernorm_input, layernorm_output = \
+                    self.default_decoder_cross_attention(
+                        encoder_output,
+                        enc_dec_attn_mask,
+                        layernorm_input,
+                        layernorm_output,
+                        bias_dropout_add_func)
+            elif self.layer_type == LayerType.retro_encoder:
+                layernorm_input, layernorm_output = \
+                    self.retro_encoder_cross_attention(
+                        retriever_output,
+                        layernorm_input,
+                        layernorm_output,
+                        bias_dropout_add_func)
+            elif self.layer_type in (LayerType.retro_decoder,
+                                     LayerType.retro_decoder_with_retriever):
+                retriever_output, layernorm_input, layernorm_output = \
+                    self.retro_decoder_cross_attention(
+                        retriever_input,
+                        retriever_output,
+                        retriever_attn_mask,
+                        layernorm_input,
+                        layernorm_output,
+                        inference_params,
+                        bias_dropout_add_func)
+            else:
+                raise Exception("Unsupported layer type, '%s'." %
+                                self.layer_type.name)
 
-        # when aggregated_moe_loss received, returned moe_loss is the aggregated moe loss
-        if aggregated_moe_loss is not None:
-            moe_loss += aggregated_moe_loss
+            # MLP.
+            moe_loss = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
+            mlp_bias = torch.tensor(0.0, device=layernorm_output.device, dtype=layernorm_output.dtype)
 
-        # Second residual connection.
-        if self.apply_residual_connection_post_layernorm:
-            residual = layernorm_output
-        else:
-            residual = layernorm_input
+            if self.num_experts == 1:
+                mlp_output, mlp_bias = self.mlp(layernorm_output)
+            else:
+                mlp_output, moe_loss, _ = self.mlp(layernorm_output)
 
-        # FPDT does not support dropout yet.
-        if not self.ds_sequence_parallel_fpdt:
-            if self.drop_path is None:
-                if mlp_bias is not None:
-                    mlp_bias = mlp_bias.expand_as(residual)
-                with self.bias_dropout_add_exec_handler():
-                    output = bias_dropout_add_func(
-                        mlp_output,
-                        mlp_bias,
-                        residual,
-                        self.hidden_dropout)
+            # when aggregated_moe_loss received, returned moe_loss is the aggregated moe loss
+            if aggregated_moe_loss is not None:
+                moe_loss += aggregated_moe_loss
 
-                # Jit compiled function creates 'view' tensor. This tensor
-                # potentially gets saved in the MPU checkpoint function context,
-                # which rejects view tensors. While making a viewless tensor here
-                # won't result in memory savings (like the data loader, or
-                # p2p_communication), it serves to document the origin of this
-                # 'view' tensor.
-                output = core.utils.make_viewless_tensor(inp = output,
-                                                        requires_grad = output.requires_grad,
-                                                        keep_graph = True)
+            # Second residual connection.
+            if self.apply_residual_connection_post_layernorm:
+                residual = layernorm_output
+            else:
+                residual = layernorm_input
 
+            # FPDT does not support dropout yet.
+            if not self.ds_sequence_parallel_fpdt:
+                if self.drop_path is None:
+                    if mlp_bias is not None:
+                        mlp_bias = mlp_bias.expand_as(residual)
+                    with self.bias_dropout_add_exec_handler():
+                        output = bias_dropout_add_func(
+                            mlp_output,
+                            mlp_bias,
+                            residual,
+                            self.hidden_dropout)
+
+                    # Jit compiled function creates 'view' tensor. This tensor
+                    # potentially gets saved in the MPU checkpoint function context,
+                    # which rejects view tensors. While making a viewless tensor here
+                    # won't result in memory savings (like the data loader, or
+                    # p2p_communication), it serves to document the origin of this
+                    # 'view' tensor.
+                    output = core.utils.make_viewless_tensor(inp = output,
+                                                            requires_grad = output.requires_grad,
+                                                            keep_graph = True)
+
+                else:
+                    if mlp_bias is not None:
+                        mlp_output = mlp_output + mlp_bias
+                    out = torch.nn.functional.dropout(mlp_output,
+                                                    p=self.hidden_dropout,
+                                                    training=self.training)
+                    output = residual + self.drop_path(out)
             else:
                 if mlp_bias is not None:
                     mlp_output = mlp_output + mlp_bias
-                out = torch.nn.functional.dropout(mlp_output,
-                                                p=self.hidden_dropout,
-                                                training=self.training)
-                output = residual + self.drop_path(out)
-        else:
-            if mlp_bias is not None:
-                mlp_output = mlp_output + mlp_bias
-            output = mlp_output + residual
+                output = mlp_output + residual
 
-        if self.layer_type == LayerType.retro_decoder_with_retriever:
-            return output, retriever_output, moe_loss
-        else:
-            return output, moe_loss
+            if self.layer_type == LayerType.retro_decoder_with_retriever:
+                return output, retriever_output, moe_loss
+            else:
+                return output, moe_loss
+        finally:
+            if layer_nvtx_pushed:
+                torch.cuda.nvtx.range_pop()
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):
