@@ -12,36 +12,38 @@ DATASET="1 ${DATASET_1}"
 CHECKPOINT_PATH=./tmp
 # TOKENIZER_PATH=./tmp/tokenizer.model # offical llama tokenizer.model
 
-TP=1
-PP=1
-ZERO_STAGE=0
-MODEL_IMPL=baseline  # baseline | cola
+TP=${TP:-1}
+PP=${PP:-1}
+ZERO_STAGE=${ZERO_STAGE:-1}
+MODEL_IMPL=${MODEL_IMPL:-baseline}  # baseline | cola
+OFFLOAD_OPTIMIZER=${OFFLOAD_OPTIMIZER:-1}  # 0|1
+CPU_OPTIMIZER=${CPU_OPTIMIZER:-$OFFLOAD_OPTIMIZER}  # 0|1
 
-GPUS_PER_NODE=1
-MASTER_ADDR=localhost
-MASTER_PORT=6000
-NNODES=1
-NODE_RANK=0
+GPUS_PER_NODE=${GPUS_PER_NODE:-4}
+MASTER_ADDR=${MASTER_ADDR:-localhost}
+MASTER_PORT=${MASTER_PORT:-6000}
+NNODES=${NNODES:-1}
+NODE_RANK=${NODE_RANK:-0}
 
 # llama-1B
-HIDDEN_SIZE=2048 # e.g. llama-13b: 5120
-FFN_HIDDEN_SIZE=5504 # e.g. llama-13b: 13824
-MLP_RANK=512 # CoLA bottleneck rank
-NUM_LAYERS=24 # e.g. llama-13b: 40
-NUM_HEADS=32 # e.g. llama-13b: 40
-SEQ_LENGTH=1024
-NUM_KV_HEADS=32 # llama2 70B uses GQA
+HIDDEN_SIZE=${HIDDEN_SIZE:-2048} # e.g. llama-13b: 5120
+FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-5504} # e.g. llama-13b: 13824
+MLP_RANK=${MLP_RANK:-512} # CoLA bottleneck rank
+NUM_LAYERS=${NUM_LAYERS:-24} # e.g. llama-13b: 40
+NUM_HEADS=${NUM_HEADS:-32} # e.g. llama-13b: 40
+SEQ_LENGTH=${SEQ_LENGTH:-1024}
+NUM_KV_HEADS=${NUM_KV_HEADS:-32} # llama2 70B uses GQA
 
-MICRO_BATCH_SIZE=1
-GLOBAL_BATCH_SIZE=4 # e.g. llama: 4M tokens
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-4} # e.g. llama: 4M tokens
 # TRAIN_STEPS=250000 # e.g. llama: 1T tokens / 4M tokens_per_batch = 250000 steps
-TRAIN_STEPS=10
-LR=3e-4
-MIN_LR=3e-5
+TRAIN_STEPS=${TRAIN_STEPS:-10}
+LR=${LR:-3e-4}
+MIN_LR=${MIN_LR:-3e-5}
 # LR_WARMUP_STEPS=2000
-LR_WARMUP_STEPS=2
-WEIGHT_DECAY=0.1
-GRAD_CLIP=1
+LR_WARMUP_STEPS=${LR_WARMUP_STEPS:-2}
+WEIGHT_DECAY=${WEIGHT_DECAY:-0.1}
+GRAD_CLIP=${GRAD_CLIP:-1}
 
 ## Activation checkpointing saves GPU memory, but reduces training speed
 # activation_checkpoint="true"
@@ -70,36 +72,36 @@ fi
 ######################################
 
 
-# cat <<EOT > $DS_CONFIG
-# {
-#   "train_batch_size" : $GLOBAL_BATCH_SIZE,
-#   "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
-#   "steps_per_print": 1,
-#   "zero_optimization": {
-#     "stage": $ZERO_STAGE,
-#     "offload_optimizer": {
-#       "device": "cpu"
-#     }
-#   },
-#   "bf16": {
-#     "enabled": true
-#   },
-#   "flops_profiler": {
-#     "enabled": true,
-#     "profile_step": 5,
-#     "module_depth": 2,
-#     "top_modules": 10,
-#     "detailed": true,
-#     "output_file": "${BASE_PATH}/.logging/0401/ds_flops_profile_rank${NODE_RANK}.txt"
-#   }
-# }
-# EOT
+if [ "$ZERO_STAGE" -eq 0 ] && [ "$OFFLOAD_OPTIMIZER" -eq 1 ]; then
+  echo "Invalid config: ZeRO-0 cannot be used with optimizer offloading."
+  exit 1
+fi
 
-cat <<EOT > $DS_CONFIG
+if [ "$OFFLOAD_OPTIMIZER" -eq 1 ]; then
+  cat <<EOT > $DS_CONFIG
 {
   "train_batch_size" : $GLOBAL_BATCH_SIZE,
   "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
   "steps_per_print": 1,
+  "wall_clock_breakdown": true,
+  "zero_optimization": {
+    "stage": $ZERO_STAGE,
+    "offload_optimizer": {
+      "device": "cpu"
+    }
+  },
+  "bf16": {
+    "enabled": true
+  }
+}
+EOT
+else
+  cat <<EOT > $DS_CONFIG
+{
+  "train_batch_size" : $GLOBAL_BATCH_SIZE,
+  "train_micro_batch_size_per_gpu": $MICRO_BATCH_SIZE,
+  "steps_per_print": 1,
+  "wall_clock_breakdown": true,
   "zero_optimization": {
     "stage": $ZERO_STAGE
   },
@@ -108,6 +110,7 @@ cat <<EOT > $DS_CONFIG
   }
 }
 EOT
+fi
 
 ds_args=""
 ds_args=" --deepspeed ${ds_args}"
@@ -124,6 +127,11 @@ if [ "${activation_checkpoint}" = "true" ]; then
   ds_args="--recompute-granularity full --recompute-method uniform ${ds_args}"
   ## new argument for recomputing only the attention layer
   # ds_args="--recompute-granularity selective ${ds_args}"
+fi
+
+CPU_OPTIMIZER_ARG=""
+if [ "$CPU_OPTIMIZER" -eq 1 ]; then
+  CPU_OPTIMIZER_ARG="--cpu-optimizer"
 fi
 
 
@@ -213,6 +221,7 @@ fi
 "${LAUNCH_PREFIX[@]}" torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --model-impl $MODEL_IMPL \
+       $CPU_OPTIMIZER_ARG \
        --tensor-model-parallel-size $TP \
        --pipeline-model-parallel-size $PP \
        --num-layers $NUM_LAYERS \
