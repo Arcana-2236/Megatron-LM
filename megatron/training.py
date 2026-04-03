@@ -1187,10 +1187,10 @@ def training_log(loss_dict, total_loss_dict, learning_rate, iteration,
         total_loss_dict[skipped_iters_key] = 0
         total_loss_dict[nan_iters_key] = 0
         print_rank_last(log_string)
-        if report_memory_flag and learning_rate > 0.:
-            # Report memory after optimizer state has been initialized.
+        if report_memory_flag > 0 and learning_rate > 0.:
+            # Report memory for the first few training iterations.
             report_memory('(after {} iterations)'.format(iteration))
-            report_memory_flag = False
+            report_memory_flag -= 1
         timers.log(timers_to_log, normalizer=args.log_interval)
 
     return report_memory_flag
@@ -1242,7 +1242,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
 
     timers('interval-time', log_level=0).start(barrier=True)
     print_datetime('before the start of training step')
-    report_memory_flag = True
+    report_memory_flag = 5
     if args.random_ltd:
         assert model[0].random_ltd_enabled()
         args.random_ltd_layer_num = model[0].random_ltd_scheduler.get_random_ltd_layer_num()
@@ -1258,7 +1258,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
         and nsys_profile_end_step >= nsys_profile_start_step
     )
     nsys_profile_started = False
-        
+
     while iteration < args.train_iters and (args.train_tokens is None or \
         args.consumed_train_tokens < args.train_tokens):
         trigger(on_step_begin)
