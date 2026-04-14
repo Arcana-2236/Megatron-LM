@@ -67,3 +67,4 @@ for DP in ${DP_VALUES}; do
 done
 
 echo "[sweep] Completed ${TOTAL_RUNS} runs."
+[ "${DRY_RUN}" -eq 1 ] || python3 "${SCRIPT_DIR}/summarize_pretrain_llama2_sweep.py" --log-dir "${LOG_DIR}" --date-tag "${DATE_TAG}" --strict-12

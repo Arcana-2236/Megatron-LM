@@ -77,6 +77,12 @@ if [ "$ZERO_STAGE" -eq 0 ] && [ "$OFFLOAD_OPTIMIZER" -eq 1 ]; then
   exit 1
 fi
 
+NO_PIPELINE_PARALLEL_ARG=""
+if [ "$ZERO_STAGE" -eq 0 ]; then
+  # Force pure DDP-style path for ZeRO-0 by avoiding DeepSpeed pipeline engine.
+  NO_PIPELINE_PARALLEL_ARG="--no-pipeline-parallel"
+fi
+
 if [ "$OFFLOAD_OPTIMIZER" -eq 1 ]; then
   cat <<EOT > $DS_CONFIG
 {
@@ -221,6 +227,7 @@ fi
 "${LAUNCH_PREFIX[@]}" torchrun $DISTRIBUTED_ARGS \
        pretrain_gpt.py \
        --model-impl $MODEL_IMPL \
+       $NO_PIPELINE_PARALLEL_ARG \
        $CPU_OPTIMIZER_ARG \
        --tensor-model-parallel-size $TP \
        --pipeline-model-parallel-size $PP \

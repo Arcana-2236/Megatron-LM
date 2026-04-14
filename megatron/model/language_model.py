@@ -538,17 +538,33 @@ class TransformerLanguageModel(MegatronModule):
         # Rotary positional embeddings
         rotary_pos_emb = None
         if self.use_rotary_position_embeddings:
+            def _normalize_rotary_pos_emb(rotary_out, target_dtype):
+                # Support both legacy (cos, sin) output and current single-frequency output.
+                if isinstance(rotary_out, tuple):
+                    q_pos_emb, k_pos_emb = rotary_out
+                else:
+                    q_pos_emb = rotary_out
+                    k_pos_emb = rotary_out
+                q_pos_emb.no_checkpointing = True
+                k_pos_emb.no_checkpointing = True
+                return (q_pos_emb.to(target_dtype), k_pos_emb.to(target_dtype))
+
             if inference_params is not None:
-                rotary_pos_emb = \
-                    self.rotary_pos_emb(inference_params.max_sequence_len)
+                rotary_pos_emb = _normalize_rotary_pos_emb(
+                    self.rotary_pos_emb(inference_params.max_sequence_len),
+                    encoder_input.dtype
+                )
             else:
                 if args.curriculum_learning_legacy or args.data_efficiency_curriculum_learning:
-                    rotary_pos_emb = self.rotary_pos_emb(args.curriculum_seqlen)
+                    rotary_pos_emb = _normalize_rotary_pos_emb(
+                        self.rotary_pos_emb(args.curriculum_seqlen),
+                        encoder_input.dtype
+                    )
                 else:
-                    rotary_pos_emb_cos, rotary_pos_emb_sin = self.rotary_pos_emb(self.seq_length)
-                    rotary_pos_emb_cos.no_checkpointing = True
-                    rotary_pos_emb_sin.no_checkpointing = True
-                    rotary_pos_emb = (rotary_pos_emb_cos.to(encoder_input.dtype), rotary_pos_emb_sin.to(encoder_input.dtype))
+                    rotary_pos_emb = _normalize_rotary_pos_emb(
+                        self.rotary_pos_emb(self.seq_length),
+                        encoder_input.dtype
+                    )
 
         # Run encoder.
         if enc_hidden_states is None:
