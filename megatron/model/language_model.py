@@ -13,7 +13,8 @@ from megatron.core.enums import ModelType
 from .enums import AttnMaskType, LayerType
 from .module import MegatronModule
 from .rotary_pos_embedding import apply_rotary_pos_emb, RotaryEmbedding
-from .transformer import ParallelTransformer
+from .transformer import ParallelTransformer as BaselineParallelTransformer
+from .cola_transformer import ParallelTransformer as CoLAParallelTransformer
 from .utils import get_linear_layer
 from .utils import init_method_normal, scaled_init_method_normal, gather_and_init
 
@@ -408,6 +409,7 @@ class TransformerLanguageModel(MegatronModule):
         self.add_retriever = args.retro_add_retriever
         self.untie_embeddings_and_output_weights = args.untie_embeddings_and_output_weights
         self.num_experts = num_experts
+        transformer_cls = CoLAParallelTransformer if args.model_impl == "cola" else BaselineParallelTransformer
 
         # Embeddings.
         if self.pre_process:
@@ -439,7 +441,7 @@ class TransformerLanguageModel(MegatronModule):
         # Encoder (usually set to True, False if part of an encoder-decoder
         # architecture and in encoder-only stage).
         if self.add_encoder:
-            self.encoder = ParallelTransformer(
+            self.encoder = transformer_cls(
                 config,
                 model_type=args.model_type if not args.retro_add_retriever \
                     else ModelType.retro_decoder,
@@ -455,7 +457,7 @@ class TransformerLanguageModel(MegatronModule):
         # Decoder (usually set to False, True if part of an encoder-decoder
         # architecture and in decoder-only stage).
         if self.add_decoder:
-            self.decoder = ParallelTransformer(
+            self.decoder = transformer_cls(
                 config,
                 model_type=args.model_type,
                 layer_type=LayerType.decoder,
