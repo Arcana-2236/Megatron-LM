@@ -14,7 +14,7 @@ from megatron.core.pipeline_parallel import p2p_communication
 from megatron.core.enums import ModelType
 from megatron.core.utils import get_attr_wrapped_model, get_model_type, get_model_config
 
-from megatron.utils import unwrap_model
+from megatron.utils import unwrap_model, report_memory
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 
@@ -357,6 +357,9 @@ def forward_backward_no_pipelining(*,
     # synchronize gradients).
     output_tensor = forward_step(forward_step_func, data_iterator, model, num_microbatches,
                                  input_tensor, forward_data_store, config, collect_non_loss_data)
+
+    if args.rank == 0:
+        report_memory('[after forward before backward]', reset_peak_stats=True)
 
     if not forward_only:
         backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)

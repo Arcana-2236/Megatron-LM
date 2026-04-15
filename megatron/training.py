@@ -738,6 +738,9 @@ def train_step(forward_step_func, data_iterator,
                                        (torchDDP, LocalDDP, Float16Module))
         unwrapped_model.cancel_gradients_last_layer(args.curr_iteration)
 
+    if args.rank == 0:
+        report_memory('[before optimizer step]', reset_peak_stats=True)
+
     # Update parameters.
     timers('optimizer', log_level=1).start(barrier=args.barrier_with_L1_time)
     if args.deepspeed:

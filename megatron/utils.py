@@ -105,7 +105,7 @@ def average_losses_across_data_parallel_group(losses):
     return averaged_losses
 
 
-def report_memory(name):
+def report_memory(name, reset_peak_stats=False):
     """Simple GPU memory report."""
     mega_bytes = 1024.0 * 1024.0
     string = name + ' memory (MB)'
@@ -120,6 +120,8 @@ def report_memory(name):
     if mpu.get_data_parallel_rank() == 0:
         print("[Rank {}] {}".format(torch.distributed.get_rank(), string),
               flush=True)
+    if reset_peak_stats:
+        get_accelerator().reset_peak_memory_stats()
 
 
 def print_params_min_max_norm(optimizer, iteration):
@@ -405,4 +407,3 @@ def found_kill_switch():
         return True
     else:
         return False
-
