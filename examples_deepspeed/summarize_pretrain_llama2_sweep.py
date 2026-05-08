@@ -41,8 +41,14 @@ HEADER = [
     "CPU Mem (GB)",
     "Iter Time (ms)",
     "Tokens/s/GPU",
+    "Forward (ms)",
     "Optimizer Step (ms)",
     "Backward (ms)",
+    "Backward Inner (ms)",
+    "Backward Allreduce (ms)",
+    "Train Step (ms)",
+    "Optimizer Allgather (ms)",
+    "Optimizer Gradients (ms)",
     "Peak Gap (GB)",
 ]
 
@@ -66,6 +72,12 @@ def parse_metrics(log_path: Path) -> Dict[str, Optional[float]]:
     tgs_vals: List[float] = []
     opt_steps: List[float] = []
     bwd_vals: List[float] = []
+    fwd_vals: List[float] = []
+    bwd_inner_vals: List[float] = []
+    bwd_allreduce_vals: List[float] = []
+    step_vals: List[float] = []
+    opt_allgather_vals: List[float] = []
+    opt_gradients_vals: List[float] = []
 
     with log_path.open("r", encoding="utf-8", errors="ignore") as f:
         for line in f:
@@ -93,11 +105,31 @@ def parse_metrics(log_path: Path) -> Dict[str, Optional[float]]:
             m = OPT_STEP_RE.search(line)
             if m:
                 opt_steps.append(float(m.group(1)))
-                continue
 
             m = BWD_RE.search(line)
             if m:
                 bwd_vals.append(float(m.group(1)))
+
+            # Parse additional timer breakdown fields from the same "time (ms)" lines.
+            if "time (ms)" in line:
+                m = re.search(r"\|\s*fwd:\s*([0-9.]+)", line)
+                if m:
+                    fwd_vals.append(float(m.group(1)))
+                m = re.search(r"\|\s*bwd_inner:\s*([0-9.]+)", line)
+                if m:
+                    bwd_inner_vals.append(float(m.group(1)))
+                m = re.search(r"\|\s*bwd_allreduce:\s*([0-9.]+)", line)
+                if m:
+                    bwd_allreduce_vals.append(float(m.group(1)))
+                m = re.search(r"\|\s*step:\s*([0-9.]+)", line)
+                if m:
+                    step_vals.append(float(m.group(1)))
+                m = re.search(r"optimizer_allgather:\s*([0-9.]+)", line)
+                if m:
+                    opt_allgather_vals.append(float(m.group(1)))
+                m = re.search(r"optimizer_gradients:\s*([0-9.]+)", line)
+                if m:
+                    opt_gradients_vals.append(float(m.group(1)))
 
     stable_mem = [(a, r) for i, a, r in mem_rows if i >= 2]
     if not stable_mem:
@@ -113,8 +145,20 @@ def parse_metrics(log_path: Path) -> Dict[str, Optional[float]]:
 
     stable_opt = stable_values(opt_steps)
     stable_bwd = stable_values(bwd_vals)
+    stable_fwd = stable_values(fwd_vals)
+    stable_bwd_inner = stable_values(bwd_inner_vals)
+    stable_bwd_allreduce = stable_values(bwd_allreduce_vals)
+    stable_step = stable_values(step_vals)
+    stable_opt_allgather = stable_values(opt_allgather_vals)
+    stable_opt_gradients = stable_values(opt_gradients_vals)
     opt_ms = statistics.median(stable_opt) if stable_opt else None
     bwd_ms = statistics.median(stable_bwd) if stable_bwd else None
+    fwd_ms = statistics.median(stable_fwd) if stable_fwd else None
+    bwd_inner_ms = statistics.median(stable_bwd_inner) if stable_bwd_inner else None
+    bwd_allreduce_ms = statistics.median(stable_bwd_allreduce) if stable_bwd_allreduce else None
+    step_ms = statistics.median(stable_step) if stable_step else None
+    opt_allgather_ms = statistics.median(stable_opt_allgather) if stable_opt_allgather else None
+    opt_gradients_ms = statistics.median(stable_opt_gradients) if stable_opt_gradients else None
 
     peak_gap_gb = None
     if peak_alloc_gb is not None and peak_res_gb is not None:
@@ -126,8 +170,14 @@ def parse_metrics(log_path: Path) -> Dict[str, Optional[float]]:
         "CPU Mem (GB)": cpu_mem_gb,
         "Iter Time (ms)": iter_time_ms,
         "Tokens/s/GPU": tgs,
+        "Forward (ms)": fwd_ms,
         "Optimizer Step (ms)": opt_ms,
         "Backward (ms)": bwd_ms,
+        "Backward Inner (ms)": bwd_inner_ms,
+        "Backward Allreduce (ms)": bwd_allreduce_ms,
+        "Train Step (ms)": step_ms,
+        "Optimizer Allgather (ms)": opt_allgather_ms,
+        "Optimizer Gradients (ms)": opt_gradients_ms,
         "Peak Gap (GB)": peak_gap_gb,
     }
 
@@ -187,8 +237,14 @@ def write_csv(out_csv: Path, rows: List[Dict[str, object]]) -> None:
                     fmt_float(r["CPU Mem (GB)"], 2),  # type: ignore[arg-type]
                     fmt_float(r["Iter Time (ms)"], 1),  # type: ignore[arg-type]
                     "" if r["Tokens/s/GPU"] is None else str(r["Tokens/s/GPU"]),
+                    fmt_float(r["Forward (ms)"], 1),  # type: ignore[arg-type]
                     fmt_float(r["Optimizer Step (ms)"], 1),  # type: ignore[arg-type]
                     fmt_float(r["Backward (ms)"], 1),  # type: ignore[arg-type]
+                    fmt_float(r["Backward Inner (ms)"], 1),  # type: ignore[arg-type]
+                    fmt_float(r["Backward Allreduce (ms)"], 2),  # type: ignore[arg-type]
+                    fmt_float(r["Train Step (ms)"], 1),  # type: ignore[arg-type]
+                    fmt_float(r["Optimizer Allgather (ms)"], 2),  # type: ignore[arg-type]
+                    fmt_float(r["Optimizer Gradients (ms)"], 1),  # type: ignore[arg-type]
                     fmt_float(r["Peak Gap (GB)"], 2),  # type: ignore[arg-type]
                 ]
             )
@@ -197,14 +253,14 @@ def write_csv(out_csv: Path, rows: List[Dict[str, object]]) -> None:
 def write_txt(out_txt: Path, rows: List[Dict[str, object]]) -> None:
     with out_txt.open("w", encoding="utf-8") as f:
         f.write(
-            "| Model | DP | ZeRO | Offload | Peak GPU Alloc (GB) | Peak GPU Reserved (GB) | CPU Mem (GB) | Iter Time (ms) | Tokens/s/GPU | Optimizer Step (ms) | Backward (ms) | Peak Gap (GB) |\n"
+            "| Model | DP | ZeRO | Offload | Peak GPU Alloc (GB) | Peak GPU Reserved (GB) | CPU Mem (GB) | Iter Time (ms) | Tokens/s/GPU | Forward (ms) | Optimizer Step (ms) | Backward (ms) | Backward Inner (ms) | Backward Allreduce (ms) | Train Step (ms) | Optimizer Allgather (ms) | Optimizer Gradients (ms) | Peak Gap (GB) |\n"
         )
         f.write(
-            "| ----- | -: | ---: | ------: | ------------------: | ---------------------: | -----------: | -------------: | -----------: | ------------------: | ------------: | ------------: |\n"
+            "| ----- | -: | ---: | ------: | ------------------: | ---------------------: | -----------: | -------------: | -----------: | -----------: | ------------------: | ------------: | ------------------: | ----------------------: | --------------: | -----------------------: | ------------------------: | ------------: |\n"
         )
         for r in rows:
             f.write(
-                "| {Model} | {DP} | {ZeRO} | {Offload} | {alloc} | {res} | {cpu} | {iter_ms} | {tgs} | {opt} | {bwd} | {gap} |\n".format(
+                "| {Model} | {DP} | {ZeRO} | {Offload} | {alloc} | {res} | {cpu} | {iter_ms} | {tgs} | {fwd} | {opt} | {bwd} | {bwd_inner} | {bwd_allreduce} | {step} | {opt_allgather} | {opt_gradients} | {gap} |\n".format(
                     Model=r["Model"],
                     DP=r["DP"],
                     ZeRO=r["ZeRO"],
@@ -214,8 +270,14 @@ def write_txt(out_txt: Path, rows: List[Dict[str, object]]) -> None:
                     cpu=fmt_float(r["CPU Mem (GB)"], 2),  # type: ignore[arg-type]
                     iter_ms=fmt_float(r["Iter Time (ms)"], 1),  # type: ignore[arg-type]
                     tgs="" if r["Tokens/s/GPU"] is None else str(r["Tokens/s/GPU"]),
+                    fwd=fmt_float(r["Forward (ms)"], 1),  # type: ignore[arg-type]
                     opt=fmt_float(r["Optimizer Step (ms)"], 1),  # type: ignore[arg-type]
                     bwd=fmt_float(r["Backward (ms)"], 1),  # type: ignore[arg-type]
+                    bwd_inner=fmt_float(r["Backward Inner (ms)"], 1),  # type: ignore[arg-type]
+                    bwd_allreduce=fmt_float(r["Backward Allreduce (ms)"], 2),  # type: ignore[arg-type]
+                    step=fmt_float(r["Train Step (ms)"], 1),  # type: ignore[arg-type]
+                    opt_allgather=fmt_float(r["Optimizer Allgather (ms)"], 2),  # type: ignore[arg-type]
+                    opt_gradients=fmt_float(r["Optimizer Gradients (ms)"], 1),  # type: ignore[arg-type]
                     gap=fmt_float(r["Peak Gap (GB)"], 2),  # type: ignore[arg-type]
                 )
             )
@@ -264,8 +326,14 @@ def main() -> None:
                 "CPU Mem (GB)": None,
                 "Iter Time (ms)": None,
                 "Tokens/s/GPU": None,
+                "Forward (ms)": None,
                 "Optimizer Step (ms)": None,
                 "Backward (ms)": None,
+                "Backward Inner (ms)": None,
+                "Backward Allreduce (ms)": None,
+                "Train Step (ms)": None,
+                "Optimizer Allgather (ms)": None,
+                "Optimizer Gradients (ms)": None,
                 "Peak Gap (GB)": None,
             }
         rows.append({"Model": model, "DP": dp, "ZeRO": zero, "Offload": offload, **metrics})

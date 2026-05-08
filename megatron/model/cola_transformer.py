@@ -21,6 +21,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.nvtx import nvtx_range
 import deepspeed
 from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
@@ -189,33 +190,31 @@ class CoLAParallelMLP(MegatronModule):
             raise NotImplementedError("CoLAParallelMLP does not currently support ds_sequence_parallel_fpdt.")
 
     def forward(self, hidden_states):
-        torch.cuda.nvtx.range_push("cola_mlp_up_proj")
-        rank_hidden, rank_bias = self.cola_h_to_2r(hidden_states)
-        if rank_bias is not None:
-            rank_hidden = rank_hidden + rank_bias
-        rank_hidden = F.silu(rank_hidden)
-        gate_rank, up_rank = torch.chunk(rank_hidden, 2, dim=-1)
+        with nvtx_range("cola_mlp_up_proj"):
+            rank_hidden, rank_bias = self.cola_h_to_2r(hidden_states)
+            if rank_bias is not None:
+                rank_hidden = rank_hidden + rank_bias
+            rank_hidden = F.silu(rank_hidden)
+            gate_rank, up_rank = torch.chunk(rank_hidden, 2, dim=-1)
 
-        gate, gate_bias = self.cola_gate_r_to_dff(gate_rank)
-        up, up_bias = self.cola_up_r_to_dff(up_rank)
-        if gate_bias is not None:
-            gate = gate + gate_bias
-        if up_bias is not None:
-            up = up + up_bias
+            gate, gate_bias = self.cola_gate_r_to_dff(gate_rank)
+            up, up_bias = self.cola_up_r_to_dff(up_rank)
+            if gate_bias is not None:
+                gate = gate + gate_bias
+            if up_bias is not None:
+                up = up + up_bias
 
-        intermediate_parallel = F.silu(gate) * up
-        torch.cuda.nvtx.range_pop()
+            intermediate_parallel = F.silu(gate) * up
 
-        torch.cuda.nvtx.range_push("cola_mlp_down_proj")
         # [s, b, r]
-        down_rank, down_rank_bias = self.cola_dff_to_r(intermediate_parallel)
-        if down_rank_bias is not None:
-            down_rank = down_rank + down_rank_bias
-        down_rank = F.silu(down_rank)
+        with nvtx_range("cola_mlp_down_proj"):
+            down_rank, down_rank_bias = self.cola_dff_to_r(intermediate_parallel)
+            if down_rank_bias is not None:
+                down_rank = down_rank + down_rank_bias
+            down_rank = F.silu(down_rank)
 
-        # [s, b, h]
-        output, output_bias = self.cola_r_to_h(down_rank)
-        torch.cuda.nvtx.range_pop()
+            # [s, b, h]
+            output, output_bias = self.cola_r_to_h(down_rank)
         if output_bias is not None:
             output = output + output_bias
             output_bias = None
@@ -797,58 +796,57 @@ class CoLAParallelAttention(MegatronModule):
         # Query, Key, and Value
         # =====================
         if self.attention_type == AttnType.self_attn:
-            torch.cuda.nvtx.range_push("cola_attn_qkv_proj")
-            # CoLA attention projections:
-            # [sq, b, h] -> [sq, b, 3r] -> q/k/v rank tensors -> partitioned q/k/v projections.
-            qkv_rank, qkv_rank_bias = self.cola_d_to_3r(hidden_states)
-            if qkv_rank_bias is not None:
-                qkv_rank = qkv_rank + qkv_rank_bias
-            qkv_rank = F.silu(qkv_rank)
-            q_rank, k_rank, v_rank = torch.chunk(qkv_rank, 3, dim=-1)
+            with nvtx_range("cola_attn_qkv_proj"):
+                # CoLA attention projections:
+                # [sq, b, h] -> [sq, b, 3r] -> q/k/v rank tensors -> partitioned q/k/v projections.
+                qkv_rank, qkv_rank_bias = self.cola_d_to_3r(hidden_states)
+                if qkv_rank_bias is not None:
+                    qkv_rank = qkv_rank + qkv_rank_bias
+                qkv_rank = F.silu(qkv_rank)
+                q_rank, k_rank, v_rank = torch.chunk(qkv_rank, 3, dim=-1)
 
-            query_proj, query_bias = self.cola_q_r_to_proj(q_rank)
-            key_proj, key_bias = self.cola_k_r_to_kv(k_rank)
-            value_proj, value_bias = self.cola_v_r_to_kv(v_rank)
-            if query_bias is not None:
-                query_proj = query_proj + query_bias
-            if key_bias is not None:
-                key_proj = key_proj + key_bias
-            if value_bias is not None:
-                value_proj = value_proj + value_bias
+                query_proj, query_bias = self.cola_q_r_to_proj(q_rank)
+                key_proj, key_bias = self.cola_k_r_to_kv(k_rank)
+                value_proj, value_bias = self.cola_v_r_to_kv(v_rank)
+                if query_bias is not None:
+                    query_proj = query_proj + query_bias
+                if key_bias is not None:
+                    key_proj = key_proj + key_bias
+                if value_bias is not None:
+                    value_proj = value_proj + value_bias
 
-            # Keep the same packed representation expected by downstream reshape/split logic.
-            mixed_x_layer = torch.cat((query_proj, key_proj, value_proj), dim=-1)
-            
-            if self.enable_ds_sequence_parallel:
-                assert self.projection_size == self.kv_projection_size
-                seq_len, bs = mixed_x_layer.shape[0], mixed_x_layer.shape[1]
-                query_layer = mixed_x_layer[:, :, :self.projection_size].reshape(seq_len, bs, -1, self.head_dim)
-                key_layer = mixed_x_layer[:, :, self.projection_size:self.projection_size+self.kv_projection_size].reshape(seq_len, bs, -1, self.head_dim)
-                value_layer = mixed_x_layer[:, :, self.projection_size+self.kv_projection_size:].reshape(seq_len, bs, -1, self.head_dim)
-            if self.sequence_parallel and not self.enable_ds_sequence_parallel:
-                seq_len, bs = mixed_x_layer.shape[0], mixed_x_layer.shape[1]
-                each_hidden_size = mixed_x_layer.shape[-1] // 3
-                query_layer = mixed_x_layer[:, :, :each_hidden_size].reshape(seq_len, bs, -1, self.head_dim)
-                key_layer = mixed_x_layer[:, :, each_hidden_size:each_hidden_size+each_hidden_size].reshape(seq_len, bs, -1, self.head_dim)
-                value_layer = mixed_x_layer[:, :, each_hidden_size+each_hidden_size:].reshape(seq_len, bs, -1, self.head_dim)
-            else:
-                # [sq, b, ((nq + 2 * nkv) * hn)] --> [sq, b, nkv, (nq // nkv + 2), hn]
-                new_tensor_shape = mixed_x_layer.size()[:-1] + \
-                    (-1, (self.num_key_value_groups + 2),
-                    self.hidden_size_per_attention_head)
-                mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
+                # Keep the same packed representation expected by downstream reshape/split logic.
+                mixed_x_layer = torch.cat((query_proj, key_proj, value_proj), dim=-1)
 
-                # [sq, b, nkv, (nq // nkv + 2), hn] --> 3 [sq, b, np, hn]
-                (query_layer,
-                 key_layer,
-                 value_layer) = self.split_tensor(mixed_x_layer)
+                if self.enable_ds_sequence_parallel:
+                    assert self.projection_size == self.kv_projection_size
+                    seq_len, bs = mixed_x_layer.shape[0], mixed_x_layer.shape[1]
+                    query_layer = mixed_x_layer[:, :, :self.projection_size].reshape(seq_len, bs, -1, self.head_dim)
+                    key_layer = mixed_x_layer[:, :, self.projection_size:self.projection_size+self.kv_projection_size].reshape(seq_len, bs, -1, self.head_dim)
+                    value_layer = mixed_x_layer[:, :, self.projection_size+self.kv_projection_size:].reshape(seq_len, bs, -1, self.head_dim)
+                if self.sequence_parallel and not self.enable_ds_sequence_parallel:
+                    seq_len, bs = mixed_x_layer.shape[0], mixed_x_layer.shape[1]
+                    each_hidden_size = mixed_x_layer.shape[-1] // 3
+                    query_layer = mixed_x_layer[:, :, :each_hidden_size].reshape(seq_len, bs, -1, self.head_dim)
+                    key_layer = mixed_x_layer[:, :, each_hidden_size:each_hidden_size+each_hidden_size].reshape(seq_len, bs, -1, self.head_dim)
+                    value_layer = mixed_x_layer[:, :, each_hidden_size+each_hidden_size:].reshape(seq_len, bs, -1, self.head_dim)
+                else:
+                    # [sq, b, ((nq + 2 * nkv) * hn)] --> [sq, b, nkv, (nq // nkv + 2), hn]
+                    new_tensor_shape = mixed_x_layer.size()[:-1] + \
+                        (-1, (self.num_key_value_groups + 2),
+                        self.hidden_size_per_attention_head)
+                    mixed_x_layer = mixed_x_layer.view(*new_tensor_shape)
 
-            # Repeat kv
-            if self.use_gqa:
-                key_layer = self.repeat_kv(key_layer, self.num_key_value_groups)
-                value_layer = self.repeat_kv(value_layer,
-                                             self.num_key_value_groups)
-            torch.cuda.nvtx.range_pop()
+                    # [sq, b, nkv, (nq // nkv + 2), hn] --> 3 [sq, b, np, hn]
+                    (query_layer,
+                     key_layer,
+                     value_layer) = self.split_tensor(mixed_x_layer)
+
+                # Repeat kv
+                if self.use_gqa:
+                    key_layer = self.repeat_kv(key_layer, self.num_key_value_groups)
+                    value_layer = self.repeat_kv(value_layer,
+                                                 self.num_key_value_groups)
         else:
             assert not self.use_gqa, 'GQA + cross-attn not tested yet'
 
@@ -938,55 +936,53 @@ class CoLAParallelAttention(MegatronModule):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
-        torch.cuda.nvtx.range_push("cola_attn_core")
-        if self.enable_ds_sequence_parallel:
-            batch_dim_idx = 1
-            if self.use_flash_attn:
-                if not self.use_flash_attn_triton:
-                    query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
-                            for x in (query_layer, key_layer, value_layer)]
-                    batch_dim_idx = 0
+        with nvtx_range("cola_attn_core"):
+            if self.enable_ds_sequence_parallel:
+                batch_dim_idx = 1
+                if self.use_flash_attn:
+                    if not self.use_flash_attn_triton:
+                        query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
+                                for x in (query_layer, key_layer, value_layer)]
+                        batch_dim_idx = 0
 
-                context_layer = self.dist_attn(query_layer, key_layer, value_layer, batch_dim_idx, rotary_pos_emb=rotary_pos_emb)
+                    context_layer = self.dist_attn(query_layer, key_layer, value_layer, batch_dim_idx, rotary_pos_emb=rotary_pos_emb)
 
-                if not self.use_flash_attn_triton:
-                    context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
-            else:
-                context_layer = self.dist_attn(query_layer, key_layer, value_layer, attention_mask)
-        else:
-            if self.use_flash_attn:
-                if not self.use_flash_attn_triton:
-                    query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
-                            for x in (query_layer, key_layer, value_layer)]
-
-                if self.sequence_parallel:
-                    context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
+                    if not self.use_flash_attn_triton:
+                        context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
                 else:
-                    with tensor_parallel.get_cuda_rng_tracker().fork():
+                    context_layer = self.dist_attn(query_layer, key_layer, value_layer, attention_mask)
+            else:
+                if self.use_flash_attn:
+                    if not self.use_flash_attn_triton:
+                        query_layer, key_layer, value_layer = [rearrange(x, 's b ... -> b s ...').contiguous()
+                                for x in (query_layer, key_layer, value_layer)]
+
+                    if self.sequence_parallel:
                         context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
+                    else:
+                        with tensor_parallel.get_cuda_rng_tracker().fork():
+                            context_layer = self.core_attention_flash(query_layer, key_layer, value_layer)
 
-                if not self.use_flash_attn_triton:
-                    context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
-            else:
-                if self.checkpoint_core_attention:
-                    context_layer = self._checkpointed_attention_forward(
-                        query_layer, key_layer, value_layer, attention_mask)
+                    if not self.use_flash_attn_triton:
+                        context_layer = rearrange(context_layer, 'b s h d -> s b (h d)').contiguous()
                 else:
-                    context_layer = self.core_attention(
-                        query_layer, key_layer, value_layer, attention_mask)
-        torch.cuda.nvtx.range_pop()
+                    if self.checkpoint_core_attention:
+                        context_layer = self._checkpointed_attention_forward(
+                            query_layer, key_layer, value_layer, attention_mask)
+                    else:
+                        context_layer = self.core_attention(
+                            query_layer, key_layer, value_layer, attention_mask)
 
         # =================
         # Output. [sq, b, h]
         # =================
 
-        torch.cuda.nvtx.range_push("cola_attn_out_proj")
-        down_rank, down_rank_bias = self.cola_out_d_to_r(context_layer)
-        if down_rank_bias is not None:
-            down_rank = down_rank + down_rank_bias
-        down_rank = F.silu(down_rank)
-        output, bias = self.cola_out_r_to_d(down_rank)
-        torch.cuda.nvtx.range_pop()
+        with nvtx_range("cola_attn_out_proj"):
+            down_rank, down_rank_bias = self.cola_out_d_to_r(context_layer)
+            if down_rank_bias is not None:
+                down_rank = down_rank + down_rank_bias
+            down_rank = F.silu(down_rank)
+            output, bias = self.cola_out_r_to_d(down_rank)
 
         return output, bias
 
@@ -1439,10 +1435,8 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=None,
                 rotary_pos_emb=None,
                 aggregated_moe_loss=None):
-        layer_nvtx_pushed = False
-        if hidden_states.is_cuda:
-            torch.cuda.nvtx.range_push(f"layer_{self.layer_number - 1}")
-            layer_nvtx_pushed = True
+        layer_nvtx = nvtx_range(f"layer_{self.layer_number - 1}")
+        layer_nvtx.__enter__()
         try:
             # hidden_states: [s, b, h]
 
@@ -1599,8 +1593,7 @@ class ParallelTransformerLayer(MegatronModule):
             else:
                 return output, moe_loss
         finally:
-            if layer_nvtx_pushed:
-                torch.cuda.nvtx.range_pop()
+            layer_nvtx.__exit__(None, None, None)
 
 
 class ParallelTransformerLayerPipe(ParallelTransformerLayer):

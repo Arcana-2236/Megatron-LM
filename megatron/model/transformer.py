@@ -21,6 +21,7 @@ from megatron.model.fused_softmax import FusedScaleMaskSoftmax
 from megatron.model.fused_bias_gelu import bias_gelu_impl
 from megatron.model.rotary_pos_embedding import apply_rotary_pos_emb
 from megatron.model.utils import attention_mask_func, openai_gelu, erf_gelu
+from megatron.nvtx import nvtx_range
 import deepspeed
 from deepspeed.moe.layer import MoE
 from deepspeed.accelerator import get_accelerator
@@ -168,33 +169,23 @@ class ParallelMLP(MegatronModule):
         if self.ds_sequence_parallel_fpdt:
             output, output_bias = FPDT_FFN.apply(hidden_states, self.dense_h_to_4h.weight, self.dense_h_to_4h.bias, self.dense_4h_to_h.weight, self.dense_4h_to_h.bias, self.add_bias, self.fpdt_FFN_chunk_size)
         else:
-            mlp_up_nvtx_pushed = False
-            if hidden_states.is_cuda:
-                torch.cuda.nvtx.range_push("mlp_up_proj")
-                mlp_up_nvtx_pushed = True
             # [s, b, 4hp]
-            intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
+            with nvtx_range("mlp_up_proj"):
+                intermediate_parallel, bias_parallel = self.dense_h_to_4h(hidden_states)
 
-            if self.bias_gelu_fusion:
-                assert self.add_bias is True
-                # DeepSpeed FLOPS profiler temporarily substitues functions like F.gelu to calculate the throughput
-                assert hasattr(self, "__flops__") or self.activation_func == F.gelu
-                intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
-            else:
-                if bias_parallel is not None:
-                    intermediate_parallel = intermediate_parallel + bias_parallel
-                intermediate_parallel = self.activation_func(intermediate_parallel)
-            if mlp_up_nvtx_pushed:
-                torch.cuda.nvtx.range_pop()
+                if self.bias_gelu_fusion:
+                    assert self.add_bias is True
+                    # DeepSpeed FLOPS profiler temporarily substitues functions like F.gelu to calculate the throughput
+                    assert hasattr(self, "__flops__") or self.activation_func == F.gelu
+                    intermediate_parallel = bias_gelu_impl(intermediate_parallel, bias_parallel)
+                else:
+                    if bias_parallel is not None:
+                        intermediate_parallel = intermediate_parallel + bias_parallel
+                    intermediate_parallel = self.activation_func(intermediate_parallel)
 
             # [s, b, h]
-            mlp_down_nvtx_pushed = False
-            if hidden_states.is_cuda:
-                torch.cuda.nvtx.range_push("mlp_down_proj")
-                mlp_down_nvtx_pushed = True
-            output, output_bias = self.dense_4h_to_h(intermediate_parallel)
-            if mlp_down_nvtx_pushed:
-                torch.cuda.nvtx.range_pop()
+            with nvtx_range("mlp_down_proj"):
+                output, output_bias = self.dense_4h_to_h(intermediate_parallel)
         return output, output_bias
 
 class SwitchMLP(MegatronModule):
@@ -733,10 +724,8 @@ class ParallelAttention(MegatronModule):
         # =====================
         # Query, Key, and Value
         # =====================
-        attn_qkv_nvtx_pushed = False
-        if hidden_states.is_cuda:
-            torch.cuda.nvtx.range_push("attn_qkv_proj")
-            attn_qkv_nvtx_pushed = True
+        attn_qkv_nvtx = nvtx_range("attn_qkv_proj")
+        attn_qkv_nvtx.__enter__()
         if self.attention_type == AttnType.self_attn:
             # Attention heads [sq, b, h] --> [sq, b, ((nq + 2 * nkv) * hn)]
             mixed_x_layer, _ = self.query_key_value(hidden_states)
@@ -793,8 +782,7 @@ class ParallelAttention(MegatronModule):
                 (self.num_attention_heads_per_partition,
                  self.hidden_size_per_attention_head)
             query_layer = query_layer.view(*new_tensor_shape)
-        if attn_qkv_nvtx_pushed:
-            torch.cuda.nvtx.range_pop()
+        attn_qkv_nvtx.__exit__(None, None, None)
 
         # ==================================
         # Adjust key and value for inference
@@ -861,10 +849,8 @@ class ParallelAttention(MegatronModule):
             # otherwise, only relative positional embedding takes effect
             # value_layer = apply_rotary_pos_emb(value_layer, k_pos_emb)
 
-        attn_core_nvtx_pushed = False
-        if hidden_states.is_cuda:
-            torch.cuda.nvtx.range_push("attn_core")
-            attn_core_nvtx_pushed = True
+        attn_core_nvtx = nvtx_range("attn_core")
+        attn_core_nvtx.__enter__()
         if self.enable_ds_sequence_parallel:
             batch_dim_idx = 1
             if self.use_flash_attn:
@@ -900,20 +886,16 @@ class ParallelAttention(MegatronModule):
                 else:
                     context_layer = self.core_attention(
                         query_layer, key_layer, value_layer, attention_mask)
-        if attn_core_nvtx_pushed:
-            torch.cuda.nvtx.range_pop()
+        attn_core_nvtx.__exit__(None, None, None)
 
         # =================
         # Output. [sq, b, h]
         # =================
 
-        attn_out_nvtx_pushed = False
-        if hidden_states.is_cuda:
-            torch.cuda.nvtx.range_push("attn_out_proj")
-            attn_out_nvtx_pushed = True
+        attn_out_nvtx = nvtx_range("attn_out_proj")
+        attn_out_nvtx.__enter__()
         output, bias = self.dense(context_layer)
-        if attn_out_nvtx_pushed:
-            torch.cuda.nvtx.range_pop()
+        attn_out_nvtx.__exit__(None, None, None)
 
         return output, bias
 
@@ -1366,10 +1348,8 @@ class ParallelTransformerLayer(MegatronModule):
                 inference_params=None,
                 rotary_pos_emb=None,
                 aggregated_moe_loss=None):
-        layer_nvtx_pushed = False
-        if hidden_states.is_cuda:
-            torch.cuda.nvtx.range_push(f"layer_{self.layer_number - 1}")
-            layer_nvtx_pushed = True
+        layer_nvtx = nvtx_range(f"layer_{self.layer_number - 1}")
+        layer_nvtx.__enter__()
         # hidden_states: [s, b, h]
 
         # Layer norm at the beginning of the transformer layer.
@@ -1521,12 +1501,10 @@ class ParallelTransformerLayer(MegatronModule):
             output = mlp_output + residual
 
         if self.layer_type == LayerType.retro_decoder_with_retriever:
-            if layer_nvtx_pushed:
-                torch.cuda.nvtx.range_pop()
+            layer_nvtx.__exit__(None, None, None)
             return output, retriever_output, moe_loss
         else:
-            if layer_nvtx_pushed:
-                torch.cuda.nvtx.range_pop()
+            layer_nvtx.__exit__(None, None, None)
             return output, moe_loss
 
 

@@ -15,6 +15,7 @@ from megatron.core.enums import ModelType
 from megatron.core.utils import get_attr_wrapped_model, get_model_type, get_model_config
 
 from megatron.utils import unwrap_model, report_memory
+from megatron.nvtx import nvtx_range
 from megatron.model import DistributedDataParallel as LocalDDP
 from megatron.model import Float16Module
 
@@ -262,16 +263,17 @@ def backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, c
         output_tensor_grad = [output_tensor_grad]
 
     # Backward pass.
-    if args.deepspeed:
-        model.backward(output_tensor[0])
-    else:
-        if output_tensor_grad[0] is None and config.grad_scale_func is not None:
-            output_tensor[0] = config.grad_scale_func(output_tensor[0])
-
-        if config.deallocate_pipeline_outputs:
-            custom_backward(output_tensor[0], output_tensor_grad[0])
+    with nvtx_range("backward/loss_backward"):
+        if args.deepspeed:
+            model.backward(output_tensor[0])
         else:
-            torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
+            if output_tensor_grad[0] is None and config.grad_scale_func is not None:
+                output_tensor[0] = config.grad_scale_func(output_tensor[0])
+
+            if config.deallocate_pipeline_outputs:
+                custom_backward(output_tensor[0], output_tensor_grad[0])
+            else:
+                torch.autograd.backward(output_tensor[0], grad_tensors=output_tensor_grad[0])
 
     # Collect the grad of the input_tensor.
     input_tensor_grad = [None]
@@ -338,7 +340,8 @@ def forward_backward_no_pipelining(*,
 
     args = get_args()
     if args.deepspeed:
-        model.set_gradient_accumulation_boundary(False)
+        with nvtx_range("backward/zero1_grad_boundary_off"):
+            model.set_gradient_accumulation_boundary(False)
 
     model_type = get_model_type(model)
 
@@ -351,7 +354,8 @@ def forward_backward_no_pipelining(*,
             if not forward_only:
                 backward_step(input_tensor, output_tensor, output_tensor_grad, model_type, config, model)
     if args.deepspeed:
-        model.set_gradient_accumulation_boundary(True)
+        with nvtx_range("backward/zero1_grad_boundary_on"):
+            model.set_gradient_accumulation_boundary(True)
 
     # Run computation for last microbatch out of context handler (want to
     # synchronize gradients).
@@ -415,7 +419,8 @@ def forward_backward_pipelining_with_interleaving(*,
         """Enable asynchronous grad reductions"""
         nonlocal no_sync_context
         if no_sync_context is not None:
-            no_sync_context.__exit__(None, None, None)
+            with nvtx_range("backward/ddp_sync_enable"):
+                no_sync_context.__exit__(None, None, None)
             no_sync_context = None
     disable_grad_sync()
 
@@ -592,7 +597,8 @@ def forward_backward_pipelining_with_interleaving(*,
             if grad_sync_microbatch_id >= 0 and is_last_microbatch_for_model_chunk(grad_sync_microbatch_id):
                 grad_sync_chunk_id = get_model_chunk_id(grad_sync_microbatch_id, forward=False)
                 enable_grad_sync()
-                config.grad_sync_func(model[grad_sync_chunk_id].parameters())
+                with nvtx_range("backward/grad_sync_func"):
+                    config.grad_sync_func(model[grad_sync_chunk_id].parameters())
                 synchronized_model_chunks.add(grad_sync_chunk_id)
         disable_grad_sync()
 
@@ -883,7 +889,8 @@ def forward_backward_pipelining_with_interleaving(*,
                 params.extend(model[model_chunk_id].parameters())
                 synchronized_model_chunks.add(model_chunk_id)
         if params:
-            config.grad_sync_func(params)
+            with nvtx_range("backward/grad_sync_func"):
+                config.grad_sync_func(params)
 
     return forward_data_store
 
@@ -1032,7 +1039,8 @@ def forward_backward_pipelining_without_interleaving(*,
         """Enable asynchronous grad reductions"""
         nonlocal no_sync_context
         if no_sync_context is not None:
-            no_sync_context.__exit__(None, None, None)
+            with nvtx_range("backward/ddp_sync_enable"):
+                no_sync_context.__exit__(None, None, None)
             no_sync_context = None
     disable_grad_sync()
 
@@ -1183,6 +1191,7 @@ def forward_backward_pipelining_without_interleaving(*,
     if no_sync_context is not None:
         enable_grad_sync()
         if config.grad_sync_func is not None:
-            config.grad_sync_func(model.parameters())
+            with nvtx_range("backward/grad_sync_func"):
+                config.grad_sync_func(model.parameters())
 
     return forward_data_store

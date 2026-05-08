@@ -49,6 +49,7 @@ from megatron.data.data_samplers import build_pretraining_data_loader
 from megatron.utils import calc_params_l2_norm
 from megatron.core.pipeline_parallel import get_forward_backward_func
 from megatron.utils import report_memory, throughput_calculator, checkpoint_throughput_calculator, update_rotary_pos_emb
+from megatron.nvtx import nvtx_range
 from megatron.model.vision.knn_monitor import compute_feature_bank
 from megatron.arguments import core_transformer_config_from_args
 from megatron.profiler import setup_profiler, trigger, on_step_begin, on_step_end
@@ -747,10 +748,12 @@ def train_step(forward_step_func, data_iterator,
         increment = get_num_microbatches() * \
                     args.micro_batch_size * \
                     args.data_parallel_size
-        model[0].step(lr_kwargs={'increment': increment})
+        with nvtx_range("train/optimizer_step"):
+            model[0].step(lr_kwargs={'increment': increment})
         update_successful = model[0].was_step_applied()
     else:
-        update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
+        with nvtx_range("train/optimizer_step"):
+            update_successful, grad_norm, num_zeros_in_grad = optimizer.step(args, timers)
     timers('optimizer').stop()
 
     # Gather params.
@@ -1290,11 +1293,7 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                     update_rotary_pos_emb(curriculum_seqlen)
             args.curriculum_seqlen = curriculum_seqlen
         args.curr_iteration = iteration
-        iter_nvtx_pushed = False
-        if get_accelerator().device_name() == 'cuda':
-            torch.cuda.nvtx.range_push(f"train_iter_{iteration}")
-            iter_nvtx_pushed = True
-        try:
+        with nvtx_range(f"train_iter_{iteration}"):
             loss_dict, skipped_iter, grad_norm, num_zeros_in_grad = \
                 train_step(forward_step_func,
                            train_data_iterator,
@@ -1302,9 +1301,6 @@ def train(forward_step_func, model, optimizer, opt_param_scheduler,
                            optimizer,
                            opt_param_scheduler,
                            config)
-        finally:
-            if iter_nvtx_pushed:
-                torch.cuda.nvtx.range_pop()
         iteration += 1
         args.iteration = iteration
 

@@ -28,7 +28,8 @@ NODE_RANK=${NODE_RANK:-0}
 # llama-1B
 HIDDEN_SIZE=${HIDDEN_SIZE:-2048} # e.g. llama-13b: 5120
 FFN_HIDDEN_SIZE=${FFN_HIDDEN_SIZE:-5504} # e.g. llama-13b: 13824
-MLP_RANK=${MLP_RANK:-512} # CoLA bottleneck rank
+MLP_RANK=${MLP_RANK:-$((HIDDEN_SIZE / 4))} # CoLA MLP bottleneck rank
+ATTN_RANK=${ATTN_RANK:-$((HIDDEN_SIZE / 4))} # CoLA attention bottleneck rank
 NUM_LAYERS=${NUM_LAYERS:-24} # e.g. llama-13b: 40
 NUM_HEADS=${NUM_HEADS:-32} # e.g. llama-13b: 40
 SEQ_LENGTH=${SEQ_LENGTH:-1024}
@@ -144,6 +145,9 @@ fi
 DISTRIBUTED_ARGS="--nproc_per_node $GPUS_PER_NODE --nnodes $NNODES --node_rank $NODE_RANK --master_addr $MASTER_ADDR --master_port $MASTER_PORT"
 
 ENABLE_NSYS=${ENABLE_NSYS:-0}
+if [ "$ENABLE_NSYS" = "1" ]; then
+  NUM_LAYERS=${NSYS_NUM_LAYERS:-4}
+fi
 NSYS_TS=$(date +%Y%m%d_%H%M%S)
 NSYS_OUT=${NSYS_OUT:-.logging/0402/llama1b_${MODEL_IMPL}_${NSYS_TS}}
 NSYS_PROFILE_START_STEP=${NSYS_PROFILE_START_STEP:-4}
@@ -164,6 +168,7 @@ if [ "$ENABLE_NSYS" = "1" ]; then
     nsys profile -w true
     -t cuda,nvtx,osrt,cudnn,cublas
     --capture-range=cudaProfilerApi
+    --capture-range-end=stop
     -x true
     --stats=true
     -o "$NSYS_OUT"
@@ -235,6 +240,7 @@ fi
        --hidden-size $HIDDEN_SIZE \
        --ffn-hidden-size $FFN_HIDDEN_SIZE \
        --mlp-rank $MLP_RANK \
+       --attn-rank $ATTN_RANK \
        --num-attention-heads $NUM_HEADS \
        --micro-batch-size $MICRO_BATCH_SIZE \
        --global-batch-size $GLOBAL_BATCH_SIZE \
