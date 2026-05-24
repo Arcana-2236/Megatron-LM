@@ -1,0 +1,88 @@
+#!/bin/bash -l
+#PBS -N mds_7b_tp4_dp2
+#PBS -A TensorCompress
+#PBS -q debug
+#PBS -l select=2:ncpus=64:ngpus=4
+#PBS -l walltime=00:10:00
+#PBS -l filesystems=home:eagle
+#PBS -j oe
+
+set -euo pipefail
+
+module use /soft/modulefiles
+module load conda cudatoolkit-standalone/12.4.1
+set +u
+conda activate dspeed_env
+set -u
+
+cd /home/$USER/offloading/Megatron-DeepSpeed
+
+NNODES=$(awk '!seen[$0]++' "$PBS_NODEFILE" | wc -l)
+GPUS_PER_NODE=4
+MASTER_ADDR=$(head -n 1 "$PBS_NODEFILE")
+MASTER_PORT=${MASTER_PORT:-$((10000 + RANDOM % 50000))}
+WORLD_SIZE=$((NNODES * GPUS_PER_NODE))
+
+TP=4
+PP=1
+DP=$((WORLD_SIZE / (TP * PP)))
+MODEL_IMPL=${MODEL_IMPL:-baseline}
+MLP_RANK=${MLP_RANK:-1024}
+ATTN_RANK=${ATTN_RANK:-1024}
+TRAIN_STEPS=${TRAIN_STEPS:-10}
+OFFLOAD_OPTIMIZER=${OFFLOAD_OPTIMIZER:-1}
+CPU_OPTIMIZER=${CPU_OPTIMIZER:-$OFFLOAD_OPTIMIZER}
+MICRO_BATCH_SIZE=${MICRO_BATCH_SIZE:-1}
+GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE:-2}
+SEQ_LENGTH=${SEQ_LENGTH:-1024}
+TAG=${TAG:-}
+
+if [ "$MODEL_IMPL" = "baseline" ]; then
+  LOG_MODEL="fr"
+else
+  LOG_MODEL="${MODEL_IMPL}_rank${MLP_RANK}"
+fi
+if [ "$OFFLOAD_OPTIMIZER" = "1" ]; then
+  LOG_OFFLOAD="offload"
+else
+  LOG_OFFLOAD="nooffload"
+fi
+RUN_TAG="${LOG_MODEL}_7b_tp${TP}_dp${DP}_zero1_${LOG_OFFLOAD}_mbz${MICRO_BATCH_SIZE}_gbz${GLOBAL_BATCH_SIZE}_seq${SEQ_LENGTH}"
+if [ -n "$TAG" ]; then
+  RUN_TAG="${TAG}_${RUN_TAG}"
+fi
+
+LOGDIR=${LOG_DIR:-.logging/0509}
+mkdir -p "$LOGDIR"
+LOGFILE="$LOGDIR/${RUN_TAG}_${PBS_JOBID}.log"
+
+echo "PBS_NODEFILE=$PBS_NODEFILE"
+cat "$PBS_NODEFILE"
+echo "NNODES=$NNODES GPUS_PER_NODE=$GPUS_PER_NODE WORLD_SIZE=$WORLD_SIZE TP=$TP PP=$PP DP=$DP"
+echo "MODEL_IMPL=$MODEL_IMPL MLP_RANK=$MLP_RANK ATTN_RANK=$ATTN_RANK TRAIN_STEPS=$TRAIN_STEPS"
+echo "OFFLOAD_OPTIMIZER=$OFFLOAD_OPTIMIZER CPU_OPTIMIZER=$CPU_OPTIMIZER MICRO_BATCH_SIZE=$MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE SEQ_LENGTH=$SEQ_LENGTH"
+echo "RUN_TAG=$RUN_TAG"
+echo "MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT"
+echo "LOGFILE=$LOGFILE"
+
+mpiexec -n "$NNODES" -ppn 1 --hostfile "$PBS_NODEFILE" \
+  bash -lc "
+    module use /soft/modulefiles
+    module load conda cudatoolkit-standalone/12.4.1
+    set +u
+    conda activate dspeed_env
+    set -u
+    cd /home/$USER/offloading/Megatron-DeepSpeed
+
+    NODE_RANK=\${PMI_RANK:-0}
+
+    MASTER_ADDR=$MASTER_ADDR MASTER_PORT=$MASTER_PORT \
+    NNODES=$NNODES NODE_RANK=\$NODE_RANK GPUS_PER_NODE=$GPUS_PER_NODE \
+    TP=$TP PP=$PP ZERO_STAGE=1 OFFLOAD_OPTIMIZER=$OFFLOAD_OPTIMIZER CPU_OPTIMIZER=$CPU_OPTIMIZER \
+    MICRO_BATCH_SIZE=$MICRO_BATCH_SIZE GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE SEQ_LENGTH=$SEQ_LENGTH \
+    HIDDEN_SIZE=4096 FFN_HIDDEN_SIZE=11008 NUM_HEADS=32 NUM_KV_HEADS=32 NUM_LAYERS=32 \
+    MODEL_IMPL=$MODEL_IMPL MLP_RANK=$MLP_RANK ATTN_RANK=$ATTN_RANK TRAIN_STEPS=$TRAIN_STEPS \
+    bash examples_deepspeed/pretrain_llama2_distributed.sh
+  " > "$LOGFILE" 2>&1
+
+echo "DONE: $LOGFILE"
