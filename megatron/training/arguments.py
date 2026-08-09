@@ -2469,8 +2469,10 @@ def _add_regularization_args(parser):
     group.add_argument('--muon-num-ns-steps', type=int, default=5,
                        help='Number of Newton-Schulz steps for Muon optimizer')
     group.add_argument('--muon-tp-mode', type=str, default='blockwise',
-                       choices=['blockwise', 'duplicated', 'distributed'],
-                       help='How to perform NS calculation for tensor model parallel weights')
+                       choices=['blockwise', 'duplicated', 'distributed', 'auto'],
+                       help='How to perform NS calculation for tensor model parallel weights. '
+                       '"auto" picks per-weight between duplicated and distributed by '
+                       'analytical cost; the others apply one mode to every weight.')
     group.add_argument('--muon-use-syrk', action='store_true',
                        help='Use the Triton SYRK kernel for the Gram matrix '
                        'in Newton-Schulz iteration.')
