@@ -18,7 +18,7 @@
 #SBATCH -t 00:30:00
 #SBATCH --mem=0
 # No --gpus-per-node: Lyris rejects it as an invalid gres spec. --exclusive gives all
-# 4 GPUs on the node, matching Experiments/profile.sh.
+# 4 GPUs on the node.
 #SBATCH --ntasks-per-node=4
 #SBATCH --segment=16
 #SBATCH --job-name=coreai_dlalgo_llm-dist_muon.bench_ns_gtp
