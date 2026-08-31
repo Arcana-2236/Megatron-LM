@@ -69,7 +69,7 @@ worth keeping straight:
 Every rank orthogonalizes concurrently and the step ends when the slowest finishes, so the
 reported step cost is the max over rank profiles, not the mean.
 
-## Measured on Nemotron-4 (152 layers, GB300, 16 NS steps, bf16 GEMMs)
+## Measured on GB300 (16 NS steps, bf16 GEMMs)
 
 Newton-Schulz time per optimizer step, per GPU. Each figure is the slowest rank profile
 for that buffer, so the total assumes a GPU drawing the worst profile on both axes.
@@ -93,6 +93,6 @@ rather than importing it, which is what keeps `padding_estimate.py` dependency-f
 will go stale if that function changes. Re-check against the reference numbers in
 `padding_estimate.py`'s module docstring after touching the packer.
 
-The model description in both files is the 152-layer Nemotron-4 hybrid Mamba-MoE. Other
+The model description in both files is a 54-layer hybrid Mamba-MoE and is fixed. Other
 models need the constants updated; `padding_estimate.py` takes them as flags, while
 `bench_ns_strategies.py` has them as module constants.

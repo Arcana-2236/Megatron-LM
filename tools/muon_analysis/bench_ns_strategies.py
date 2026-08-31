@@ -1,6 +1,6 @@
 # Copyright (c) 2026, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Benchmark Newton-Schulz distribution strategies on real Nemotron-4 problem sizes.
+"""Benchmark Newton-Schulz distribution strategies on a fixed set of problem sizes.
 
 ``TensorParallelMuon`` can orthogonalize a sharded weight three ways, selected by
 ``--muon-tp-mode``:
@@ -62,7 +62,11 @@ except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
 
 # --------------------------------------------------------------------------------------
-# Nemotron-4 (152-layer hybrid Mamba-MoE), matching the training recipe.
+# Weight shapes of the modelled workload: a 54-layer hybrid Mamba-MoE.
+#
+# These constants DEFINE the benchmark. Do not change them: they are the problem to be
+# solved, not a parameter to be tuned. Timings across runs are only comparable at these
+# values.
 # --------------------------------------------------------------------------------------
 
 HIDDEN = 8192
