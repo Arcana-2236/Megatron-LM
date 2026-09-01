@@ -412,42 +412,108 @@ def main() -> None:
         torch.distributed.destroy_process_group()
         return
 
+    # ----------------------------------------------------------------------------------
+    # Per-shape mode selection.
+    #
+    # The optimizer picks ``--muon-tp-mode`` per *buffer*, not per axis, so nothing forces
+    # every weight on an axis onto the same mode. Which mode wins is a property of the
+    # SHAPE (duplicated's redundant compute grows with the matrix; distributed's replicated
+    # ``A @ A`` term does not shrink with the group), and the winner genuinely flips within
+    # a single axis. ``per_shape`` is therefore reported as a policy alongside the two
+    # single-mode columns: each distinct shape takes whichever of ``--modes`` measured
+    # faster, and the step cost is recomputed as the max over rank profiles UNDER THAT
+    # SELECTION -- not by patching the previous single-mode winner, since the slowest
+    # profile can change once the per-shape costs do.
+    #
+    # Taking the per-shape argmin minimizes every profile's total simultaneously, so it
+    # also minimizes their max: the policy is optimal over per-shape mode assignments.
+    #
+    # Every rank of the group holds the same set of matrices, so the selection is identical
+    # on every rank and the collectives inside newton_schulz_tp stay in lockstep. The
+    # selection changes only WHICH already-benchmarked mode runs for a shape; no new
+    # numerics are introduced.
+    # ----------------------------------------------------------------------------------
+    per_shape_policy = "per_shape"
+    best_mode_for_shape: Dict[Tuple, str] = {}
+    if len(config.modes) > 1:
+        for matrix in distinct:
+            best_mode_for_shape[matrix] = min(config.modes, key=lambda m: per_shape[matrix][m])
+
+    policies = list(config.modes)
+    if best_mode_for_shape:
+        policies.append(per_shape_policy)
+
+    def resolve(matrix, policy: str) -> str:
+        """Mode a policy runs for one shape."""
+        return best_mode_for_shape[matrix] if policy == per_shape_policy else policy
+
+    if best_mode_for_shape:
+        log("\nPER-SHAPE MODE SELECTION  (policy 'per_shape' runs this mode for this shape)")
+        selection_header = f"{'local shard':>13}{'all-gathered':>14}{'selected':>13}{'ms':>9}"
+        for mode in config.modes:
+            selection_header += f"{mode:>13}"
+        log(selection_header)
+        log("-" * len(selection_header))
+        for matrix in distinct:
+            (rows, cols), shard_count = matrix
+            chosen = best_mode_for_shape[matrix]
+            line = (
+                f"{f'{rows}x{cols}':>13}{f'{rows * shard_count}x{cols}':>14}"
+                f"{chosen:>13}{per_shape[matrix][chosen]:>9.3f}"
+            )
+            for mode in config.modes:
+                line += f"{per_shape[matrix][mode]:>13.3f}"
+            log(line)
+
     log("\nPER-PROFILE  (sum over the matrices that profile owns)")
     profile_header = f"{'ranks':>6}  {'owns':<38}"
-    for mode in config.modes:
-        profile_header += f"{mode:>12}{'TF/s':>8}"
+    for policy in policies:
+        profile_header += f"{policy:>12}{'TF/s':>8}"
     log(profile_header)
     log("-" * len(profile_header))
-    totals: Dict[str, List[float]] = {mode: [] for mode in config.modes}
-    useful_totals: Dict[str, List[float]] = {mode: [] for mode in config.modes}
+    totals: Dict[str, List[float]] = {policy: [] for policy in policies}
+    useful_totals: Dict[str, List[float]] = {policy: [] for policy in policies}
     for signature, dp_ranks in sorted(profiles.items(), key=lambda kv: -len(kv[1])):
         owns = " + ".join(f"{n}x[{e[0][0]}x{e[0][1]}]" for e, n in signature)
         line = f"{len(dp_ranks):>6}  {owns:<38}"
-        for mode in config.modes:
-            total_ms = sum(per_shape[e][mode] * n for e, n in signature)
+        for policy in policies:
+            total_ms = sum(per_shape[e][resolve(e, policy)] * n for e, n in signature)
             useful = sum(
-                flop_model(e, mode, config.num_ns_steps, group_size, config.use_syrk)[1] * n
+                flop_model(
+                    e, resolve(e, policy), config.num_ns_steps, group_size, config.use_syrk
+                )[1]
+                * n
                 for e, n in signature
             )
-            totals[mode].append(total_ms)
-            useful_totals[mode].append(useful)
+            totals[policy].append(total_ms)
+            useful_totals[policy].append(useful)
             line += f"{total_ms:>11.3f}m{useful / 1e9 / total_ms:>8.0f}"
         log(line)
 
     log("-" * len(profile_header))
     step = f"{'':>6}  {'STEP COST = slowest profile':<38}"
-    for mode in config.modes:
-        slowest = max(range(len(totals[mode])), key=lambda i: totals[mode][i])
-        step += f"{totals[mode][slowest]:>11.3f}m{useful_totals[mode][slowest] / 1e9 / totals[mode][slowest]:>8.0f}"
+    for policy in policies:
+        slowest = max(range(len(totals[policy])), key=lambda i: totals[policy][i])
+        step += (
+            f"{totals[policy][slowest]:>11.3f}m"
+            f"{useful_totals[policy][slowest] / 1e9 / totals[policy][slowest]:>8.0f}"
+        )
     log(step)
     imbalance = f"{'':>6}  {'imbalance (max / mean)':<38}"
-    for mode in config.modes:
-        mean = sum(t * len(r) for t, r in zip(totals[mode], profiles.values())) / dp_size
-        imbalance += f"{max(totals[mode]) / mean:>11.2f}x{'':>8}"
+    for policy in policies:
+        mean = sum(t * len(r) for t, r in zip(totals[policy], profiles.values())) / dp_size
+        imbalance += f"{max(totals[policy]) / mean:>11.2f}x{'':>8}"
     log(imbalance)
 
-    best = min(config.modes, key=lambda m: max(totals[m]))
+    best = min(policies, key=lambda p: max(totals[p]))
     log(f"\nfastest step: {best} ({max(totals[best]):.3f} ms)")
+    if best == per_shape_policy:
+        log(
+            "  per_shape selection: "
+            + ", ".join(
+                f"{e[0][0] * e[1]}x{e[0][1]}={best_mode_for_shape[e]}" for e in distinct
+            )
+        )
     log("notes:")
     log("  useful TF/s already discounts redundancy. duplicated recomputes the whole matrix")
     log("  on every rank, so its useful TF/s is its issued TF/s divided by the group size")
