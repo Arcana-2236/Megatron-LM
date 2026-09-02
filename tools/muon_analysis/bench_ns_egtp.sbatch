@@ -75,6 +75,19 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # its store is strided. Both arms come from THIS one job over the SAME tensors under the
 # SAME composition.
 #
+# --pipelined-exchange: times each g == 1 batched-subgroup column a THIRD time with the
+# restructured exchange ('duplicated_batch_sub_g1_fused_pipe'), and scores
+# 'per_shape_batch_sub_pipe_set' against the accepted 'per_shape_batch_sub_fused_set'.
+# Identical deal, identical math, identical fused compute path -- what changes is that
+# BLOCK ownership (matrix j -> subgroup j // mine instead of j % k) makes the input
+# exchange's send buffer and the output exchange's receive buffer exact VIEWS of the
+# caller's tensors, so two of the four full-size staging copies stop existing, and the
+# per-chunk exchanges are issued async_op=True on the process group's stream so the wire
+# overlaps a DIFFERENT chunk's compute. --pipe-chunks sets the pipeline depth (4 windows of
+# 24 owned matrices here); it raises the collective count per region from 2 to 8, which at
+# the measured alpha_ib = 75.681 us costs +0.45 ms/region. All three arms come from THIS
+# one job over the SAME tensors under the SAME composition.
+#
 # --set-timing: this axis owns 192 copies each of two expert shapes, so its cost is a
 # property of the SET, not of one matrix. It times the whole owned group inside one region
 # under two arms -- unbatched ('<mode>_set', the baseline) and batched ('duplicated_batch',
@@ -94,6 +107,8 @@ options=" \
     --subgroup-sizes ${EGTP_SUBGROUP_SIZES:-1} \
     --subgroup-batched \
     --fused-ns-kernel \
+    --pipelined-exchange \
+    --pipe-chunks ${EGTP_PIPE_CHUNKS:-4} \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \

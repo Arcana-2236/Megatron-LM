@@ -448,14 +448,176 @@ PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY = "per_shape_sub_all_batch_set"
 FUSED_SUFFIX = "_fused"
 # The scored pair: reference is the accepted state PER_SHAPE_BATCH_SUBGROUP_POLICY.
 PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY = "per_shape_batch_sub_fused_set"
+# The exchange-restructure candidate (--pipelined-exchange). Same subgroup deal, same
+# batched Newton-Schulz, same coefficients -- the ONLY difference is HOW the two subgroup
+# exchanges are staged and scheduled: block ownership makes the send/receive buffers views
+# of the caller's own tensors (two of the four full-size staging copies stop existing), and
+# the per-chunk exchanges are issued async so the wire overlaps the compute of a different
+# chunk. Timed as its own column beside the arm it substitutes, from the SAME job over the
+# SAME tensors under the SAME composition. Suffix goes AFTER FUSED_SUFFIX so a pipelined
+# fused arm reads ``duplicated_batch_sub_g1_fused_pipe``; policy_mode strips both.
+PIPE_SUFFIX = "_pipe"
+# The scored pair: reference is whichever of the two accepted arms the run has enabled --
+# PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY when --fused-ns-kernel is on, else
+# PER_SHAPE_BATCH_SUBGROUP_POLICY.
+PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY = "per_shape_batch_sub_pipe_set"
 
 
 def subgroup_policy(subgroup_size: int) -> str:
     return f"{SUBGROUP_PREFIX}{subgroup_size}"
 
 
-def batch_subgroup_policy(subgroup_size: int, fused: bool = False) -> str:
-    return f"{BATCH_SUBGROUP_PREFIX}{subgroup_size}" + (FUSED_SUFFIX if fused else "")
+def batch_subgroup_policy(
+    subgroup_size: int, fused: bool = False, pipelined: bool = False
+) -> str:
+    return (
+        f"{BATCH_SUBGROUP_PREFIX}{subgroup_size}"
+        + (FUSED_SUFFIX if fused else "")
+        + (PIPE_SUFFIX if pipelined else "")
+    )
+
+
+# --------------------------------------------------------------------------------------
+# Pipelined, staging-free variant of the g == 1 subgroup exchange (--pipelined-exchange).
+#
+# ``newton_schulz_tp_subgroup``'s monolithic path is strictly serial -- ONE
+# ``all_to_all_single`` over the whole owned group, then every compute chunk, then ONE
+# ``all_to_all_single`` back -- and it stages four FULL-SIZE copies through HBM to get
+# there: the ``cat`` of strided slices on the way in, the ``permute -> reshape`` after the
+# input exchange, a ``stack``-per-destination python loop plus ``cat`` on the way out, and
+# a strided scatter into ``result``.
+#
+# Two mechanisms, one diff:
+#
+#   1. BLOCK ownership instead of round-robin. Matrix ``j`` is owned by subgroup
+#      ``j // mine`` rather than ``j % k``. Which subgroup owns which matrix is internal to
+#      this function -- the return value is still this rank's slice of EVERY matrix in
+#      INPUT order -- but with contiguous blocks the send side of the input exchange and
+#      the receive side of the output exchange become exact VIEWS of ``stack`` and
+#      ``result``, so two of the four staging copies stop existing rather than being made
+#      cheaper. This is only legal at ``subgroup_size == 1``, where each rank is its own
+#      duplication group and so appears exactly ONCE in the destination list; at g > 1 the
+#      same block goes to g destinations and the per-peer views would not be disjoint.
+#   2. The LIST form of ``all_to_all`` (one tensor per peer instead of one packed buffer),
+#      which is what lets those views be handed to NCCL directly, issued with
+#      ``async_op=True`` so the exchange runs on the process group's own stream while the
+#      compute stream runs the batched Newton-Schulz of a DIFFERENT chunk. The loop is a
+#      two-deep software pipeline: the input exchange of chunk c+1 and the output exchange
+#      of chunk c-1 are both in flight while chunk c computes.
+#
+# The two copies that remain are the ``(peer, matrix)`` transposes no exchange layout can
+# avoid -- a batched Newton-Schulz needs the matrix index outermost, an all-to-all needs
+# the peer index outermost -- and they are now INSIDE the pipeline, so they overlap the
+# wire instead of adding to it. The per-destination ``stack``/``cat`` python loop (96
+# iterations per region on the EGTP axis) collapses to one strided ``copy_`` per chunk.
+#
+# The arithmetic is untouched: each owned matrix is still assembled with its row blocks in
+# RANK order -- exactly what ``duplicated``'s ``all_gather`` + ``cat`` produces -- and run
+# through the same batched ``newton_schulz`` (or the same fused entry point), same step
+# count, same coefficients, same SYRK path. Only the batch a chunk carries changes, from
+# ``batch_chunk`` to ``ceil(mine / pipe_chunks)``, and every matrix in it is independent of
+# its neighbours in the batch.
+#
+# Collective count per region goes from 2 to ``2 * pipe_chunks``; at the measured
+# alpha_ib = 75.681 us that is +0.45 ms per region at pipe_chunks = 4, which is why the
+# chunk count is deliberately small.
+# --------------------------------------------------------------------------------------
+
+
+def _subgroup_pipelined(
+    stack: torch.Tensor,
+    steps: int,
+    coefficient_type: str,
+    tp_group,
+    use_syrk: bool,
+    fused: bool,
+    pipe_chunks: int,
+) -> torch.Tensor:
+    """``newton_schulz_tp_subgroup`` at ``subgroup_size == 1``, pipelined and staging-free.
+
+    Preconditions, all checked by the caller before dispatch here: ``partition_dim == 0``,
+    ``tp_mode == "duplicated"``, ``subgroup_size == 1``, ``batched=True`` and
+    ``count % world == 0``. Returns the same ``(count, rows, cols)`` this rank's-slice
+    tensor, in input order, that the monolithic path returns.
+    """
+    world = tp_group.size()
+    rank = tp_group.rank()
+    count, rows, cols = stack.shape
+    mine = count // world
+
+    result = torch.empty((count, rows, cols), dtype=stack.dtype, device=stack.device)
+    if mine == 0:
+        return result
+
+    n_chunks = max(1, min(int(pipe_chunks), mine))
+    chunk = (mine + n_chunks - 1) // n_chunks
+    windows = [(a, min(a + chunk, mine)) for a in range(0, mine, chunk)]
+
+    # Peer-major landing buffer for the input exchange, matrix-major buffers for compute,
+    # peer-major again for the output exchange. Only ``recv``/``sendout`` are full size --
+    # they hold the in-flight chunks -- while the compute buffers are one chunk each.
+    recv = torch.empty((world, mine, rows, cols), dtype=stack.dtype, device=stack.device)
+    sendout = torch.empty((world, mine, rows, cols), dtype=stack.dtype, device=stack.device)
+    gx = torch.empty((chunk, world * rows, cols), dtype=stack.dtype, device=stack.device)
+    tmp = (
+        torch.empty((chunk, world * rows, cols), dtype=stack.dtype, device=stack.device)
+        if fused else None
+    )
+
+    def issue_input(ci):
+        a, b = windows[ci]
+        # Send peer d the block of matrices d owns, window [a, b): a contiguous view of
+        # ``stack`` -- no packing copy. Receive from peer s that peer's shard of MY
+        # matrices, window [a, b), landing peer-major in ``recv``.
+        return torch.distributed.all_to_all(
+            [recv[s, a:b] for s in range(world)],
+            [stack[d * mine + a : d * mine + b] for d in range(world)],
+            group=tp_group,
+            async_op=True,
+        )
+
+    in_works = [None] * len(windows)
+    in_works[0] = issue_input(0)
+    out_works = []
+
+    for ci, (a, b) in enumerate(windows):
+        # Prefetch: chunk ci+1's input exchange goes on the wire BEFORE this chunk's
+        # compute is issued, so it overlaps it. Every rank issues the same sequence.
+        if ci + 1 < len(windows):
+            in_works[ci + 1] = issue_input(ci + 1)
+        in_works[ci].wait()
+        in_works[ci] = None
+        n = b - a
+        # (peer, matrix, rows, cols) -> (matrix, peer * rows, cols): per matrix the shards
+        # concatenated in RANK order, identical to duplicated's all_gather + cat(dim=0).
+        gx_c = gx[:n]
+        gx_c.view(n, world, rows, cols).copy_(recv[:, a:b].transpose(0, 1))
+
+        if fused:
+            fused_newton_schulz_batched(
+                gx_c, steps, coefficient_type, use_syrk=use_syrk, out=tmp[:n],
+            )
+            y = tmp[:n]
+        else:
+            y = newton_schulz(gx_c, steps, coefficient_type, use_syrk=use_syrk)
+
+        # Inverse transpose: row block d of every result goes to peer d, peer-major.
+        sendout[:, a:b].copy_(y.view(n, world, rows, cols).transpose(0, 1))
+        del y
+        # Peer s owns matrices [s * mine, (s + 1) * mine); its reply for window [a, b)
+        # lands DIRECTLY in the output slice -- no scatter copy.
+        out_works.append(
+            torch.distributed.all_to_all(
+                [result[s * mine + a : s * mine + b] for s in range(world)],
+                [sendout[d, a:b] for d in range(world)],
+                group=tp_group,
+                async_op=True,
+            )
+        )
+
+    for work in out_works:
+        work.wait()
+    return result
 
 
 def newton_schulz_tp_subgroup(
@@ -470,6 +632,8 @@ def newton_schulz_tp_subgroup(
     batched: bool = False,
     batch_chunk: int = 0,
     fused: bool = False,
+    pipelined: bool = False,
+    pipe_chunks: int = 4,
 ) -> torch.Tensor:
     """``duplicated`` over ``world/subgroup_size`` disjoint subgroups of the owned set.
 
@@ -502,6 +666,31 @@ def newton_schulz_tp_subgroup(
 
     stack = stack.contiguous()
     count, rows, cols = stack.shape
+
+    if pipelined:
+        # Same deal, same math, restructured exchange -- see _subgroup_pipelined. Every
+        # precondition is a hard error rather than a silent fallback, so the arm can never
+        # be scored while quietly running the monolithic path.
+        if not batched:
+            raise ValueError("pipelined subgroup exchange requires the batched path")
+        if subgroup_size != 1:
+            raise ValueError(
+                "pipelined subgroup exchange is defined at subgroup_size == 1 only, "
+                f"got {subgroup_size}"
+            )
+        if count % world != 0:
+            raise ValueError(
+                f"pipelined subgroup exchange needs count ({count}) divisible by world "
+                f"({world}): the block deal has no uneven case"
+            )
+        if fused and not HAVE_FUSED_NS:
+            raise RuntimeError(
+                "fused Newton-Schulz requested but kernels.fused_ns is unavailable"
+            )
+        return _subgroup_pipelined(
+            stack, steps, coefficient_type, tp_group, use_syrk, fused, pipe_chunks,
+        )
+
     my_sub = rank // subgroup_size           # s_r
     my_slot = rank % subgroup_size           # i_r, this rank's send-duty slot
     # Matrix j belongs to subgroup j % k, so subgroup s owns stack[s::k].
@@ -610,6 +799,7 @@ def newton_schulz_tp_subgroup(
 def time_group(
     stack, group, mode, steps, coefficient_type, iters, warmup, shard_count,
     use_syrk=False, batched=False, batch_chunk=0, subgroup_size=0, fused=False,
+    pipelined=False, pipe_chunks=4,
 ) -> float:
     """Median wall-clock ms to orthogonalize a WHOLE same-shape group in one timed region.
 
@@ -635,6 +825,8 @@ def time_group(
                 batched=batched,
                 batch_chunk=chunk,
                 fused=fused,
+                pipelined=pipelined,
+                pipe_chunks=pipe_chunks,
             )
     elif batched:
         def once():
@@ -762,6 +954,28 @@ def main() -> None:
              "normalize/cast prologue and the bf16->fp32 cast-and-store epilogue fused. "
              "Off by default, so without it the scored policy set is byte-identical to "
              "before.",
+    )
+    parser.add_argument(
+        "--pipelined-exchange",
+        action="store_true",
+        help="Under --subgroup-batched at g == 1, ALSO time each batched-subgroup column "
+             f"with the restructured exchange ('...{PIPE_SUFFIX}') and score "
+             f"'{PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY}' against the accepted state. Same "
+             "deal, same batched Newton-Schulz, same 5 steps / polar_express coefficients "
+             "/ SYRK path -- what changes is that block ownership turns the exchange "
+             "buffers into views of the caller's tensors (two of the four full-size "
+             "staging copies stop existing) and the per-chunk exchanges are issued "
+             "async_op=True so the wire overlaps a different chunk's compute. Off by "
+             "default, so without it the scored policy set is byte-identical to before.",
+    )
+    parser.add_argument(
+        "--pipe-chunks",
+        type=int,
+        default=4,
+        help="Pipeline depth for --pipelined-exchange: the owned set is split into this "
+             "many windows, each with its own pair of exchanges. Raises the collective "
+             "count per region from 2 to 2*N (at alpha_ib = 75.681 us, +0.45 ms/region at "
+             "N = 4), so keep it small; N = 1 degenerates to no overlap.",
     )
     parser.add_argument(
         "--batch-replicated-shapes",
@@ -995,7 +1209,10 @@ def main() -> None:
     best_batch_base_for_shape: Dict[Tuple, str] = {}
     best_batch_subgroup_for_shape: Dict[Tuple, str] = {}
     best_batch_subgroup_fused_for_shape: Dict[Tuple, str] = {}
+    best_batch_subgroup_pipe_for_shape: Dict[Tuple, str] = {}
+    pipe_reference_policy = PER_SHAPE_BATCH_SUBGROUP_POLICY
     fused_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
+    pipe_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_replicated_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
@@ -1059,6 +1276,22 @@ def main() -> None:
                                 config.coefficient_type, config.iters, config.warmup,
                                 shard_count, config.use_syrk, subgroup_size=g,
                                 batched=True, batch_chunk=config.batch_chunk, fused=True,
+                            )
+                        if config.pipelined_exchange and g == 1:
+                            # Same arm, same tensors, same composition -- only the staging
+                            # and the scheduling of the two exchanges differ. Timed on the
+                            # SAME fused/unfused compute path the reference arm banked, so
+                            # the delta is the exchange and nothing else. g == 1 only: the
+                            # block deal needs each rank to be its own duplication group.
+                            entry[batch_subgroup_policy(
+                                g, fused=config.fused_ns_kernel, pipelined=True
+                            )] = time_group(
+                                stack, group, "duplicated", config.num_ns_steps,
+                                config.coefficient_type, config.iters, config.warmup,
+                                shard_count, config.use_syrk, subgroup_size=g,
+                                batched=True, batch_chunk=config.batch_chunk,
+                                fused=config.fused_ns_kernel, pipelined=True,
+                                pipe_chunks=config.pipe_chunks,
                             )
                 group_ms[(matrix, count)] = entry
                 for policy, ms in entry.items():
@@ -1242,6 +1475,46 @@ def main() -> None:
                         (banked, fused_arm), key=lambda p: entry[p]
                     )
                 set_policies.append(PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY)
+            # --------------------------------------------------------------------------
+            # Scored exchange-restructure policy (--pipelined-exchange).
+            #
+            # Reference is the ACCEPTED state: the fused policy when --fused-ns-kernel is
+            # on, else the batched-subgroup policy. The only thing this policy changes
+            # relative to that reference is that a shape whose banked arm is a
+            # batched-subgroup column may bank the PIPELINED variant of that SAME arm. It
+            # never re-opens the g argmin, never re-banks a base arm and never switches the
+            # fused/unfused compute path, so it cannot be credited with any win the
+            # reference already made -- the delta is the exchange and nothing else.
+            # --------------------------------------------------------------------------
+            if config.pipelined_exchange:
+                pipe_reference_policy = (
+                    PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY if config.fused_ns_kernel
+                    else PER_SHAPE_BATCH_SUBGROUP_POLICY
+                )
+                reference_selection = (
+                    best_batch_subgroup_fused_for_shape if config.fused_ns_kernel
+                    else best_batch_subgroup_for_shape
+                )
+                for matrix in distinct:
+                    banked = reference_selection[matrix]
+                    best_batch_subgroup_pipe_for_shape[matrix] = banked
+                    if not banked.startswith(BATCH_SUBGROUP_PREFIX):
+                        # The reference did not bank a batched-subgroup arm for this shape,
+                        # so there is no pipelined counterpart to substitute.
+                        continue
+                    biggest = sorted(needed.get(matrix, ()))[-1]
+                    entry = group_ms[(matrix, biggest)]
+                    pipe_arm = banked + PIPE_SUFFIX
+                    if pipe_arm not in entry:
+                        # g != 1: no pipelined column was timed for this arm.
+                        continue
+                    pipe_audit[matrix] = (
+                        banked, entry[banked], pipe_arm, entry[pipe_arm],
+                    )
+                    best_batch_subgroup_pipe_for_shape[matrix] = min(
+                        (banked, pipe_arm), key=lambda p: entry[p]
+                    )
+                set_policies.append(PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY)
         policies += set_policies
 
     def resolve(matrix, policy: str) -> str:
@@ -1262,12 +1535,16 @@ def main() -> None:
             return best_batch_subgroup_for_shape[matrix]
         if policy == PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY:
             return best_batch_subgroup_fused_for_shape[matrix]
+        if policy == PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY:
+            return best_batch_subgroup_pipe_for_shape[matrix]
         return policy
 
     def policy_mode(policy: str) -> str:
         """The underlying tp_mode a policy runs, for the FLOP model."""
-        # The fused arm issues identical arithmetic to the arm it suffixes, so it must map
-        # to the same tp_mode and be charged the same FLOPs.
+        # The fused and pipelined arms issue identical arithmetic to the arm they suffix,
+        # so they must map to the same tp_mode and be charged the same FLOPs.
+        if policy.endswith(PIPE_SUFFIX):
+            policy = policy[: -len(PIPE_SUFFIX)]
         if policy.endswith(FUSED_SUFFIX):
             policy = policy[: -len(FUSED_SUFFIX)]
         if (
@@ -1359,10 +1636,12 @@ def main() -> None:
                          PER_SHAPE_SUBGROUP_ALL_POLICY,
                          PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY, PER_SHAPE_BATCH_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_POLICY,
-                         PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY)
+                         PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
+                         PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY)
             and not p.startswith(SUBGROUP_PREFIX)
             and not p.startswith(BATCH_SUBGROUP_PREFIX)
             and not p.endswith(FUSED_SUFFIX)
+            and not p.endswith(PIPE_SUFFIX)
         ]
         baseline = min(baseline_pool, key=lambda p: max(totals[p]))
         log(
@@ -1539,6 +1818,42 @@ def main() -> None:
                         f"fused arm {p_sel} banked on {e} whose reference arm is "
                         f"{best_batch_subgroup_for_shape[e]}"
                     )
+        if PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY in totals:
+            ref = max(totals[pipe_reference_policy])
+            cand = max(totals[PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY])
+            log(
+                f"\nexchange-restructure reference arm: {pipe_reference_policy} "
+                f"({ref:.3f} ms)  <- the ACCEPTED state"
+            )
+            log(
+                f"exchange-restructure candidate arm: "
+                f"{PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY} ({cand:.3f} ms), delta vs "
+                f"{pipe_reference_policy} = {cand - ref:+.3f} ms, delta vs {baseline} = "
+                f"{cand - max(totals[baseline]):+.3f} ms"
+            )
+            log("  exchange-restructure per-shape audit (largest owned count):")
+            log(
+                f"  {'all-gathered':>14}{'banked arm':>34}{'banked ms':>11}"
+                f"{'pipelined arm':>39}{'pipe ms':>11}{'chosen':>39}"
+            )
+            for e in distinct:
+                if e not in pipe_audit:
+                    continue
+                base_p, base_ms, arm_p, arm_ms = pipe_audit[e]
+                log(
+                    f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{base_p:>34}{base_ms:>11.3f}"
+                    f"{arm_p:>39}{arm_ms:>11.3f}"
+                    f"{best_batch_subgroup_pipe_for_shape[e]:>39}"
+                )
+            # A pipelined arm must never be banked where the reference did not already bank
+            # the very same arm unpipelined: the restructure is a substitution, not a new
+            # arm, and it must not switch the fused/unfused compute path either.
+            for e, p_sel in best_batch_subgroup_pipe_for_shape.items():
+                if p_sel.endswith(PIPE_SUFFIX):
+                    assert p_sel[: -len(PIPE_SUFFIX)] == resolve(e, pipe_reference_policy), (
+                        f"pipelined arm {p_sel} banked on {e} whose reference arm is "
+                        f"{resolve(e, pipe_reference_policy)}"
+                    )
     else:
         candidates = policies
 
@@ -1547,7 +1862,8 @@ def main() -> None:
     if best in (per_shape_policy, per_shape_set_policy, PER_SHAPE_SUBGROUP_POLICY,
                 PER_SHAPE_SUBGROUP_ALL_POLICY, PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY,
                 PER_SHAPE_BATCH_POLICY, PER_SHAPE_BATCH_SUBGROUP_POLICY,
-                PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY):
+                PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
+                PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY):
         selection = {
             per_shape_policy: best_mode_for_shape,
             per_shape_set_policy: best_set_mode_for_shape,
@@ -1557,6 +1873,7 @@ def main() -> None:
             PER_SHAPE_BATCH_POLICY: best_batch_base_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_POLICY: best_batch_subgroup_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY: best_batch_subgroup_fused_for_shape,
+            PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY: best_batch_subgroup_pipe_for_shape,
         }[best]
         log(
             f"  {best} selection: "
