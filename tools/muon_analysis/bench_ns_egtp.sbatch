@@ -44,6 +44,23 @@ export MASTER_PORT=29511
 SYRK_OPTION=""
 if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 
+# --subgroup-sizes 1 --subgroup-batched: OWNER-COMPUTES on this 2-rank axis. g=1 means the
+# duplication group is a single rank, so the 192 matrices of a shape are dealt round-robin
+# across the two ranks and each matrix is orthogonalized WHOLE by exactly one of them;
+# redundancy falls 2.0 -> 1.0. Two all_to_all_single exchanges realize it: the input side
+# gives each rank every shard of the matrices it owns (half the ingress duplicated's
+# all_gather moves, not more), and the output side hands the other rank its row-slice of
+# each result -- the result is MOVED rather than recomputed. --subgroup-batched runs the
+# owned half as ONE batched Newton-Schulz per --batch-chunk, so owner-computes composes
+# with the accepted batched arm instead of competing with it, and the scored pair is
+# 'per_shape_batch_sub_set' (candidate) vs 'per_shape_batch_set' (the accepted state,
+# i.e. 'duplicated_batch' here). Both arms come from THIS one job under ONE composition.
+# The unbatched 'duplicated_sub_g1' column is timed alongside as the control that shows
+# what batching contributes on top of owner-computes. The g list is overridable with
+# EGTP_SUBGROUP_SIZES -- deliberately NOT the GTP axis's SUBGROUP_SIZES, because the
+# driver submits both axes with --export=ALL and one shared name would leak a GTP
+# sweep list (4 8 16) onto a 2-rank group where none of those values is legal.
+#
 # The script sweeps every rank profile itself and reports the slowest, so nothing to pick.
 #
 # --set-timing: this axis owns 192 copies each of two expert shapes, so its cost is a
@@ -62,6 +79,8 @@ options=" \
     --warmup 5 \
     --set-timing \
     --batch-chunk 64 \
+    --subgroup-sizes ${EGTP_SUBGROUP_SIZES:-1} \
+    --subgroup-batched \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \

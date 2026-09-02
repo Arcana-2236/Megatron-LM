@@ -387,11 +387,42 @@ def newton_schulz_tp_batched(
 # --------------------------------------------------------------------------------------
 
 SUBGROUP_PREFIX = "duplicated_sub_g"
+# Owner-computes INSIDE the batched path (--subgroup-batched): the same subgroup deal as
+# ``duplicated_sub_g<g>``, but the owned matrices are orthogonalized as ONE batched
+# Newton-Schulz per chunk instead of one 2-D call each. At g == 1 on a 2-rank axis this is
+# literally owner-computes: each rank orthogonalizes half the matrices whole and the two
+# exchange result slices, so ``redundancy`` falls from 2.0 to 1.0.
+BATCH_SUBGROUP_PREFIX = "duplicated_batch_sub_g"
+# Reference arm for the batched-subgroup candidate: the ACCEPTED state, i.e. per shape the
+# better of the set-composed winner and the batched arm. Costs no extra timing -- both
+# columns it selects between are already measured.
+PER_SHAPE_BATCH_POLICY = "per_shape_batch_set"
+# The candidate: the same per-shape argmin with the batched-subgroup arms added.
+PER_SHAPE_BATCH_SUBGROUP_POLICY = "per_shape_batch_sub_set"
 PER_SHAPE_SUBGROUP_POLICY = "per_shape_sub_set"
+# Same substitution rule, wider scope: also on the shapes whose set-composed winner is
+# ``distributed_set``. See the ``--subgroup-all-shapes`` block near the scored policies.
+PER_SHAPE_SUBGROUP_ALL_POLICY = "per_shape_sub_all_set"
+# The replicated-batch candidate: ``per_shape_sub_all_set`` with the ALREADY-TIMED
+# ``duplicated_batch`` column added to the per-shape argmin, admitted on shard_count == 1
+# shapes ONLY. Those shapes get no subgroup column (subgrouping a replicated weight is a
+# no-op) and their set-composed winner is a per-matrix loop over the whole owned group, so
+# the batched column is the only arm that changes their cost -- and it is free to score,
+# being measured for the printed table already. The shard_count == 1 gate is not a
+# convenience: at partition_dim is None ``newton_schulz_tp_batched`` short-circuits to
+# plain ``newton_schulz`` on the stack, so the ``distributed`` collective route -- and with
+# it ``distributed_normalize_p2``, which would share ONE Frobenius norm across the B
+# matrices of a 3-D stack -- is never reached. On a sharded shape that hazard is real,
+# which is why the gate is asserted below rather than left to the argmin.
+PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY = "per_shape_sub_all_batch_set"
 
 
 def subgroup_policy(subgroup_size: int) -> str:
     return f"{SUBGROUP_PREFIX}{subgroup_size}"
+
+
+def batch_subgroup_policy(subgroup_size: int) -> str:
+    return f"{BATCH_SUBGROUP_PREFIX}{subgroup_size}"
 
 
 def newton_schulz_tp_subgroup(
@@ -403,6 +434,8 @@ def newton_schulz_tp_subgroup(
     tp_mode: str,
     use_syrk: bool = False,
     subgroup_size: int = 0,
+    batched: bool = False,
+    batch_chunk: int = 0,
 ) -> torch.Tensor:
     """``duplicated`` over ``world/subgroup_size`` disjoint subgroups of the owned set.
 
@@ -460,11 +493,29 @@ def newton_schulz_tp_subgroup(
         mine, world * rows, cols
     )
 
-    # ---- compute: the SAME 2-D newton_schulz duplicated runs, on 1/k as many matrices ---
-    full = [
-        newton_schulz(global_x[m], steps, coefficient_type, use_syrk=use_syrk)
-        for m in range(mine)
-    ]
+    # ---- compute: the SAME newton_schulz duplicated runs, on 1/k as many matrices -------
+    # ``batched=False`` is the phase-2/3 path, untouched: one 2-D call per owned matrix.
+    # ``batched=True`` stacks the owned matrices into the leading dim of ONE call per
+    # chunk -- the same dispatch ``newton_schulz_tp_batched`` already uses (3-D input ->
+    # ``batched_newton_schulz_step_tsyrk`` / ``batched_tsyrk_ex``), same coefficients, same
+    # step count, same SYRK path, no reassociation across matrices. It is what makes
+    # owner-computes composable with the accepted batched arm: the batch simply becomes
+    # ``count/k`` matrices per rank instead of ``count``.
+    if batched:
+        chunk = batch_chunk if (batch_chunk and batch_chunk > 0) else max(mine, 1)
+        full_t = torch.empty_like(global_x)
+        for a in range(0, mine, chunk):
+            full_t[a : a + chunk] = newton_schulz(
+                global_x[a : a + chunk], steps, coefficient_type, use_syrk=use_syrk
+            )
+        # Views, not copies: the output exchange below indexes 2-D matrices either way.
+        full = [full_t[m] for m in range(mine)]
+    else:
+        full = [
+            newton_schulz(global_x[m], steps, coefficient_type, use_syrk=use_syrk)
+            for m in range(mine)
+        ]
+        full_t = None
     del recv, global_x
 
     # ---- output exchange: hand every rank its row-slice of every matrix ----------------
@@ -479,7 +530,7 @@ def newton_schulz_tp_subgroup(
         )
     else:
         send_out = torch.empty((0, cols), dtype=stack.dtype, device=stack.device)
-    del full
+    del full, full_t
     out = torch.empty((count * rows, cols), dtype=stack.dtype, device=stack.device)
     torch.distributed.all_to_all_single(
         out,
@@ -530,6 +581,8 @@ def time_group(
                 tp_mode=mode,
                 use_syrk=use_syrk,
                 subgroup_size=subgroup_size,
+                batched=batched,
+                batch_chunk=chunk,
             )
     elif batched:
         def once():
@@ -625,6 +678,37 @@ def main() -> None:
              "newton_schulz_tp_subgroup. Empty (the default) leaves it off entirely.",
     )
     parser.add_argument(
+        "--subgroup-batched",
+        action="store_true",
+        help="Under --set-timing with --subgroup-sizes, ALSO time a batched variant of "
+             "each subgroup column ('duplicated_batch_sub_g<g>'): the same subgroup deal "
+             "with the owned matrices orthogonalized as one batched Newton-Schulz per "
+             "--batch-chunk instead of one 2-D call each. Adds two scored policies, "
+             f"'{PER_SHAPE_BATCH_POLICY}' (the accepted-state reference: per shape the "
+             f"better of the set winner and 'duplicated_batch') and "
+             f"'{PER_SHAPE_BATCH_SUBGROUP_POLICY}' (the same argmin with the batched-"
+             "subgroup arms added). Off by default, so without it every column, policy "
+             "and scored number is byte-identical to before.",
+    )
+    parser.add_argument(
+        "--subgroup-all-shapes",
+        action="store_true",
+        help="Additionally score 'per_shape_sub_all_set': the same subgroup substitution "
+             "as 'per_shape_sub_set' but on EVERY shape that has a subgroup column, "
+             "including the ones whose set-composed winner is 'distributed_set'. Off by "
+             "default, so without it the scored policy set is byte-identical to before.",
+    )
+    parser.add_argument(
+        "--batch-replicated-shapes",
+        action="store_true",
+        help="Additionally score '" + PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY + "': "
+             "'" + PER_SHAPE_SUBGROUP_ALL_POLICY + "' with the already-timed '"
+             + BATCH_POLICY + "' column added to the per-shape argmin, on shard_count == 1 "
+             "(replicated) shapes ONLY. Costs no extra timing -- both columns it selects "
+             "between are already measured for the printed table. Off by default, so "
+             "without it the scored policy set is byte-identical to before.",
+    )
+    parser.add_argument(
         "--batch-chunk",
         type=int,
         default=64,
@@ -680,6 +764,10 @@ def main() -> None:
             f"--subgroup-sizes {g} must divide the {group_size}-rank group and be smaller "
             f"than it (g == group size is plain 'duplicated')."
         )
+    if config.subgroup_batched:
+        assert config.set_timing and subgroup_sizes, (
+            "--subgroup-batched needs --set-timing and a non-empty --subgroup-sizes."
+        )
     if subgroup_sizes:
         assert "duplicated" in config.modes, (
             "subgroup duplication is a 'duplicated' variant; keep duplicated in --modes."
@@ -717,6 +805,29 @@ def main() -> None:
             f"these g and enters the scored policy '{PER_SHAPE_SUBGROUP_POLICY}', which "
             f"substitutes it ONLY on shapes whose unscoped set-composed winner is already "
             f"'duplicated{SET_SUFFIX}'."
+        )
+    if subgroup_sizes and config.subgroup_batched:
+        log(
+            f"subgroup_batched=True: also timing '{BATCH_SUBGROUP_PREFIX}<g>' (owner-"
+            f"computes inside the batched path) and scoring "
+            f"'{PER_SHAPE_BATCH_SUBGROUP_POLICY}' against its accepted-state reference "
+            f"'{PER_SHAPE_BATCH_POLICY}'. At g=1 on this axis each matrix is "
+            f"orthogonalized by exactly ONE rank, so redundancy falls to 1.0."
+        )
+    if subgroup_sizes and config.subgroup_all_shapes:
+        log(
+            f"subgroup_all_shapes=True: also scoring '{PER_SHAPE_SUBGROUP_ALL_POLICY}', "
+            f"the same substitution on EVERY shape that has a subgroup column, including "
+            f"the ones whose winner is 'distributed{SET_SUFFIX}'. Costs no extra timing: "
+            f"those columns are already measured for the table."
+        )
+    if config.batch_replicated_shapes:
+        log(
+            f"batch_replicated_shapes=True: also scoring "
+            f"'{PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY}', i.e. "
+            f"'{PER_SHAPE_SUBGROUP_ALL_POLICY}' with the '{BATCH_POLICY}' column added to "
+            f"the per-shape argmin on shard_count == 1 shapes only. Costs no extra timing: "
+            f"that column is already measured for the table."
         )
     log("")
 
@@ -814,6 +925,13 @@ def main() -> None:
     set_policies: List[str] = []
     best_set_mode_for_shape: Dict[Tuple, str] = {}
     best_subgroup_for_shape: Dict[Tuple, str] = {}
+    best_subgroup_all_for_shape: Dict[Tuple, str] = {}
+    best_subgroup_all_batch_for_shape: Dict[Tuple, str] = {}
+    best_batch_base_for_shape: Dict[Tuple, str] = {}
+    best_batch_subgroup_for_shape: Dict[Tuple, str] = {}
+    subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
+    batch_subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
+    batch_replicated_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     if config.set_timing:
         # Every (shape, owned count) pair that appears in any rank profile, timed once.
         needed: Dict[Tuple, set] = {}
@@ -859,6 +977,13 @@ def main() -> None:
                         config.coefficient_type, config.iters, config.warmup, shard_count,
                         config.use_syrk, subgroup_size=g,
                     )
+                    if config.subgroup_batched:
+                        entry[batch_subgroup_policy(g)] = time_group(
+                            stack, group, "duplicated", config.num_ns_steps,
+                            config.coefficient_type, config.iters, config.warmup,
+                            shard_count, config.use_syrk, subgroup_size=g, batched=True,
+                            batch_chunk=config.batch_chunk,
+                        )
                 group_ms[(matrix, count)] = entry
                 for policy, ms in entry.items():
                     log(
@@ -900,14 +1025,117 @@ def main() -> None:
                 biggest = sorted(needed.get(matrix, ()))[-1]
                 entry = group_ms[(matrix, biggest)]
                 arms = [g for g in subgroup_sizes if subgroup_policy(g) in entry]
-                if base != duplicated_set or not arms:
+                if not arms:
+                    # shard_count == 1: nothing to redistribute, no column was timed.
                     best_subgroup_for_shape[matrix] = base
+                    best_subgroup_all_for_shape[matrix] = base
                     continue
                 best_g = min(arms, key=lambda g: entry[subgroup_policy(g)])
-                best_subgroup_for_shape[matrix] = min(
-                    (base, subgroup_policy(best_g)), key=lambda p: entry[p]
+                best_arm = subgroup_policy(best_g)
+                subgroup_audit[matrix] = (base, entry[base], best_arm, entry[best_arm])
+                # Widest scope (--subgroup-all-shapes): substitute wherever the subgroup
+                # arm wins, INCLUDING the shapes whose winner is ``distributed_set``.
+                best_subgroup_all_for_shape[matrix] = min(
+                    (base, best_arm), key=lambda p: entry[p]
+                )
+                # Narrow scope (the phase-2 policy, unchanged): only where the reference
+                # already chose a duplication group, i.e. base == duplicated_set.
+                best_subgroup_for_shape[matrix] = (
+                    best_subgroup_all_for_shape[matrix] if base == duplicated_set else base
                 )
             set_policies.append(PER_SHAPE_SUBGROUP_POLICY)
+            if config.subgroup_all_shapes:
+                set_policies.append(PER_SHAPE_SUBGROUP_ALL_POLICY)
+        # ------------------------------------------------------------------------------
+        # Scored replicated-batch policy (--batch-replicated-shapes).
+        #
+        # The reference is the accepted state ``per_shape_sub_all_set``; the ONLY thing
+        # this policy changes relative to it is that shard_count == 1 shapes may bank the
+        # ``duplicated_batch`` column instead of their per-matrix loop. Those shapes have
+        # no subgroup column at all (none is timed for them), so the reference banked their
+        # set-composed winner unchanged and there is nothing here to re-bank.
+        #
+        # The shard_count == 1 gate is the safety property, and it is enforced twice: the
+        # loop only ever looks at BATCH_POLICY under ``shard_count == 1``, and the result
+        # is asserted afterwards. Reason: only at partition_dim is None does
+        # ``newton_schulz_tp_batched`` short-circuit to plain ``newton_schulz``, keeping the
+        # 3-D stack away from ``distributed_normalize_p2``'s whole-tensor
+        # ``(x*x).sum()``. On a sharded shape the batched column is NOT a per-matrix-
+        # equivalent arm and must never enter this argmin.
+        #
+        # Costs zero extra GPU time: BATCH_POLICY is timed for every shape already (see the
+        # SET-COMPOSED block above); only the argmin that forms the policy widens.
+        # ------------------------------------------------------------------------------
+        if config.batch_replicated_shapes:
+            if PER_SHAPE_SUBGROUP_ALL_POLICY not in set_policies:
+                log(
+                    f"\nbatch_replicated_shapes=True but '{PER_SHAPE_SUBGROUP_ALL_POLICY}' "
+                    "was not scored (needs --subgroup-all-shapes and >1 mode); skipping "
+                    f"'{PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY}' rather than scoring it "
+                    "against an ambiguous reference."
+                )
+            else:
+                for matrix in distinct:
+                    (_, _), shard_count = matrix
+                    base = best_subgroup_all_for_shape[matrix]
+                    best_subgroup_all_batch_for_shape[matrix] = base
+                    if shard_count != 1:
+                        # Sharded: the batched column is a different computation on the
+                        # collective route. Never a candidate here.
+                        continue
+                    biggest = sorted(needed.get(matrix, ()))[-1]
+                    entry = group_ms[(matrix, biggest)]
+                    if BATCH_POLICY not in entry:
+                        continue
+                    batch_replicated_audit[matrix] = (
+                        base, entry[base], BATCH_POLICY, entry[BATCH_POLICY],
+                    )
+                    best_subgroup_all_batch_for_shape[matrix] = min(
+                        (base, BATCH_POLICY), key=lambda p: entry[p]
+                    )
+                banked = [
+                    m for m, p in best_subgroup_all_batch_for_shape.items()
+                    if p == BATCH_POLICY
+                ]
+                assert all(m[1] == 1 for m in banked), (
+                    f"{BATCH_POLICY} banked on a sharded shape: "
+                    f"{[m for m in banked if m[1] != 1]}"
+                )
+                set_policies.append(PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY)
+        # ------------------------------------------------------------------------------
+        # Scored batched-subgroup pair (--subgroup-batched).
+        #
+        # The reference is the ACCEPTED state, not B_set: per shape, the better of the
+        # set-composed winner and the batched arm -- which on the EGTP axis is exactly the
+        # 'duplicated_batch' that phase 1 banked. Charging this candidate against B_set
+        # would re-bank phase 1's win. Both arms are formed here, from the same job, over
+        # the same tensors, under the same composition, so the pair can never be assembled
+        # from mismatched runs.
+        # ------------------------------------------------------------------------------
+        if config.subgroup_batched and best_set_mode_for_shape:
+            for matrix in distinct:
+                biggest = sorted(needed.get(matrix, ()))[-1]
+                entry = group_ms[(matrix, biggest)]
+                base_arms = [best_set_mode_for_shape[matrix]]
+                if BATCH_POLICY in entry:
+                    base_arms.append(BATCH_POLICY)
+                base = min(base_arms, key=lambda p: entry[p])
+                best_batch_base_for_shape[matrix] = base
+                arms = [
+                    g for g in subgroup_sizes if batch_subgroup_policy(g) in entry
+                ]
+                if not arms:
+                    # shard_count == 1: nothing to redistribute, no column was timed.
+                    best_batch_subgroup_for_shape[matrix] = base
+                    continue
+                best_g = min(arms, key=lambda g: entry[batch_subgroup_policy(g)])
+                best_arm = batch_subgroup_policy(best_g)
+                batch_subgroup_audit[matrix] = (base, entry[base], best_arm, entry[best_arm])
+                best_batch_subgroup_for_shape[matrix] = min(
+                    (base, best_arm), key=lambda p: entry[p]
+                )
+            set_policies.append(PER_SHAPE_BATCH_POLICY)
+            set_policies.append(PER_SHAPE_BATCH_SUBGROUP_POLICY)
         policies += set_policies
 
     def resolve(matrix, policy: str) -> str:
@@ -918,11 +1146,23 @@ def main() -> None:
             return best_set_mode_for_shape[matrix]
         if policy == PER_SHAPE_SUBGROUP_POLICY:
             return best_subgroup_for_shape[matrix]
+        if policy == PER_SHAPE_SUBGROUP_ALL_POLICY:
+            return best_subgroup_all_for_shape[matrix]
+        if policy == PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY:
+            return best_subgroup_all_batch_for_shape[matrix]
+        if policy == PER_SHAPE_BATCH_POLICY:
+            return best_batch_base_for_shape[matrix]
+        if policy == PER_SHAPE_BATCH_SUBGROUP_POLICY:
+            return best_batch_subgroup_for_shape[matrix]
         return policy
 
     def policy_mode(policy: str) -> str:
         """The underlying tp_mode a policy runs, for the FLOP model."""
-        if policy == BATCH_POLICY or policy.startswith(SUBGROUP_PREFIX):
+        if (
+            policy == BATCH_POLICY
+            or policy.startswith(SUBGROUP_PREFIX)
+            or policy.startswith(BATCH_SUBGROUP_PREFIX)
+        ):
             return "duplicated"
         return policy[: -len(SET_SUFFIX)] if policy.endswith(SET_SUFFIX) else policy
 
@@ -1003,7 +1243,10 @@ def main() -> None:
         # composition, which is what a candidate delta is subtracted from.
         baseline_pool = [
             p for p in set_policies
-            if p != BATCH_POLICY and p != PER_SHAPE_SUBGROUP_POLICY
+            if p not in (BATCH_POLICY, PER_SHAPE_SUBGROUP_POLICY,
+                         PER_SHAPE_SUBGROUP_ALL_POLICY,
+                         PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY, PER_SHAPE_BATCH_POLICY,
+                         PER_SHAPE_BATCH_SUBGROUP_POLICY)
             and not p.startswith(SUBGROUP_PREFIX)
         ]
         baseline = min(baseline_pool, key=lambda p: max(totals[p]))
@@ -1027,16 +1270,141 @@ def main() -> None:
                     for e in distinct
                 )
             )
+        if PER_SHAPE_SUBGROUP_ALL_POLICY in set_policies:
+            # This candidate's scored pair. Its INCREMENTAL reference is the accepted
+            # state (per_shape_sub_set), because that policy already banked the
+            # duplicated_set shapes; what is new here is the substitution on the shapes
+            # whose winner is distributed_set. Both deltas are printed so neither the
+            # incremental nor the cumulative number has to be reconstructed by hand.
+            wide = max(totals[PER_SHAPE_SUBGROUP_ALL_POLICY])
+            narrow = max(totals[PER_SHAPE_SUBGROUP_POLICY])
+            log(
+                f"subgroup-all candidate arm: {PER_SHAPE_SUBGROUP_ALL_POLICY} "
+                f"({wide:.3f} ms), delta vs {PER_SHAPE_SUBGROUP_POLICY} = "
+                f"{wide - narrow:+.3f} ms, delta vs {baseline} = "
+                f"{wide - max(totals[baseline]):+.3f} ms"
+            )
+            log(
+                "  subgroup-all selection: "
+                + ", ".join(
+                    f"{e[0][0] * e[1]}x{e[0][1]}={best_subgroup_all_for_shape[e]}"
+                    for e in distinct
+                )
+            )
+            # Per-shape audit: the substitution rule is an argmin over measured medians,
+            # so print the pair it chose between, on the largest owned count, for every
+            # shape that HAS a subgroup column. Without this the group delta cannot be
+            # attributed to a region.
+            audit_header = (
+                f"  {'all-gathered':>14}{'base policy':>19}{'base ms':>10}"
+                f"{'best subgroup':>19}{'subgroup ms':>13}{'chosen':>19}"
+            )
+            log("  subgroup-all per-shape audit (largest owned count):")
+            log(audit_header)
+            for e in distinct:
+                if e not in subgroup_audit:
+                    continue
+                base_p, base_ms, arm_p, arm_ms = subgroup_audit[e]
+                log(
+                    f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{base_p:>19}{base_ms:>10.3f}"
+                    f"{arm_p:>19}{arm_ms:>13.3f}{best_subgroup_all_for_shape[e]:>19}"
+                )
+        if PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY in set_policies:
+            # This candidate's scored pair. Its INCREMENTAL reference is the accepted
+            # state (per_shape_sub_all_set), which already banked every subgroup
+            # substitution; what is new here is the batched column on the replicated
+            # (shard_count == 1) shapes. Both deltas are printed so neither the incremental
+            # nor the cumulative number has to be reconstructed by hand.
+            cand = max(totals[PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY])
+            ref = max(totals[PER_SHAPE_SUBGROUP_ALL_POLICY])
+            log(
+                f"batch-replicated reference arm (accepted state): "
+                f"{PER_SHAPE_SUBGROUP_ALL_POLICY} ({ref:.3f} ms)"
+            )
+            log(
+                f"batch-replicated candidate arm: "
+                f"{PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY} ({cand:.3f} ms), delta vs "
+                f"{PER_SHAPE_SUBGROUP_ALL_POLICY} = {cand - ref:+.3f} ms, delta vs "
+                f"{baseline} = {cand - max(totals[baseline]):+.3f} ms"
+            )
+            log(
+                "  batch-replicated selection: "
+                + ", ".join(
+                    f"{e[0][0] * e[1]}x{e[0][1]}={best_subgroup_all_batch_for_shape[e]}"
+                    for e in distinct
+                )
+            )
+            # Per-shape audit over the shapes the argmin actually widened, i.e. the
+            # replicated ones. Without it the group delta cannot be attributed to a region.
+            audit_header = (
+                f"  {'all-gathered':>14}{'shard_count':>13}{'base policy':>25}"
+                f"{'base ms':>10}{'batched arm':>19}{'batched ms':>12}{'chosen':>25}"
+            )
+            log("  batch-replicated per-shape audit (largest owned count, "
+                "shard_count == 1 shapes only):")
+            log(audit_header)
+            for e in distinct:
+                if e not in batch_replicated_audit:
+                    continue
+                base_p, base_ms, arm_p, arm_ms = batch_replicated_audit[e]
+                log(
+                    f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{e[1]:>13}{base_p:>25}"
+                    f"{base_ms:>10.3f}{arm_p:>19}{arm_ms:>12.3f}"
+                    f"{best_subgroup_all_batch_for_shape[e]:>25}"
+                )
+        if PER_SHAPE_BATCH_SUBGROUP_POLICY in set_policies:
+            # This candidate's scored pair, printed so it is one grep away and can never be
+            # formed from arms measured in different jobs or under different compositions.
+            cand = max(totals[PER_SHAPE_BATCH_SUBGROUP_POLICY])
+            ref = max(totals[PER_SHAPE_BATCH_POLICY])
+            log(
+                f"batch-subgroup reference arm (accepted state): "
+                f"{PER_SHAPE_BATCH_POLICY} ({ref:.3f} ms)"
+            )
+            log(
+                f"batch-subgroup candidate arm: {PER_SHAPE_BATCH_SUBGROUP_POLICY} "
+                f"({cand:.3f} ms), delta vs {PER_SHAPE_BATCH_POLICY} = "
+                f"{cand - ref:+.3f} ms, delta vs {baseline} = "
+                f"{cand - max(totals[baseline]):+.3f} ms"
+            )
+            log(
+                "  batch-subgroup selection: "
+                + ", ".join(
+                    f"{e[0][0] * e[1]}x{e[0][1]}={best_batch_subgroup_for_shape[e]}"
+                    for e in distinct
+                )
+            )
+            audit_header = (
+                f"  {'all-gathered':>14}{'base policy':>25}{'base ms':>10}"
+                f"{'best batch subgroup':>25}{'subgroup ms':>13}{'chosen':>25}"
+            )
+            log("  batch-subgroup per-shape audit (largest owned count):")
+            log(audit_header)
+            for e in distinct:
+                if e not in batch_subgroup_audit:
+                    continue
+                base_p, base_ms, arm_p, arm_ms = batch_subgroup_audit[e]
+                log(
+                    f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{base_p:>25}{base_ms:>10.3f}"
+                    f"{arm_p:>25}{arm_ms:>13.3f}"
+                    f"{best_batch_subgroup_for_shape[e]:>25}"
+                )
     else:
         candidates = policies
 
     best = min(candidates, key=lambda p: max(totals[p]))
     log(f"\nfastest step: {best} ({max(totals[best]):.3f} ms)")
-    if best in (per_shape_policy, per_shape_set_policy, PER_SHAPE_SUBGROUP_POLICY):
+    if best in (per_shape_policy, per_shape_set_policy, PER_SHAPE_SUBGROUP_POLICY,
+                PER_SHAPE_SUBGROUP_ALL_POLICY, PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY,
+                PER_SHAPE_BATCH_POLICY, PER_SHAPE_BATCH_SUBGROUP_POLICY):
         selection = {
             per_shape_policy: best_mode_for_shape,
             per_shape_set_policy: best_set_mode_for_shape,
             PER_SHAPE_SUBGROUP_POLICY: best_subgroup_for_shape,
+            PER_SHAPE_SUBGROUP_ALL_POLICY: best_subgroup_all_for_shape,
+            PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY: best_subgroup_all_batch_for_shape,
+            PER_SHAPE_BATCH_POLICY: best_batch_base_for_shape,
+            PER_SHAPE_BATCH_SUBGROUP_POLICY: best_batch_subgroup_for_shape,
         }[best]
         log(
             f"  {best} selection: "
