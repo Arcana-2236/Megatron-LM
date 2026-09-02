@@ -55,7 +55,10 @@ from typing import Dict, List, Tuple
 import torch
 
 try:
-    from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz_tp
+    from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+        newton_schulz,
+        newton_schulz_tp,
+    )
 
     HAVE_EMERGING_OPTIMIZERS = True
 except ImportError:
@@ -264,6 +267,143 @@ def time_strategy(
     return statistics.median(timings)
 
 
+# --------------------------------------------------------------------------------------
+# Set-composed timing (--set-timing)
+#
+# ``time_strategy`` above times ONE matrix with a fully drained stream (barrier, record,
+# synchronize per call) and the profile total multiplies that median by the owned count.
+# That composition is exact for a per-matrix cost, but it makes any cross-matrix
+# optimization unmeasurable by construction, and it charges every matrix a full
+# host-dispatch bubble that back-to-back issue would hide.
+#
+# ``--set-timing`` times the WHOLE owned group of one shape inside a single timed region
+# and reports that region directly as the group's contribution to the profile total. Two
+# arms are timed under that identical composition so a cross-matrix optimization is scored
+# against a like-for-like baseline and never credited with the composition change itself:
+#
+#   <mode>_set       the unmodified algorithm, one ``newton_schulz_tp`` call per matrix,
+#                    issued back-to-back. This is the set-composed BASELINE arm.
+#   duplicated_batch the same math with the group stacked into one 3-D tensor: ONE
+#                    all-gather for the whole stack and ONE batched Newton-Schulz chain.
+#
+# Both arms run over the identical tensors (the unbatched arm iterates the slices of the
+# same stack the batched arm consumes whole), so data, dtype and resident footprint are
+# equal and only the issue pattern differs.
+# --------------------------------------------------------------------------------------
+
+SET_SUFFIX = "_set"
+BATCH_POLICY = "duplicated_batch"
+
+
+def newton_schulz_tp_batched(
+    x: torch.Tensor,
+    steps: int,
+    coefficient_type: str,
+    tp_group,
+    partition_dim: int | None,
+    tp_mode: str,
+    use_syrk: bool = False,
+) -> torch.Tensor:
+    """Batched ``newton_schulz_tp`` over a stack of identically shaped local shards.
+
+    ``x`` is ``(B, rows, cols)``: B matrices of the same shape, each sharded the same way
+    across ``tp_group``. ``duplicated`` mode then needs ONE all-gather for the whole stack
+    instead of B, and ``emerging_optimizers.newton_schulz`` already accepts a 3-D input and
+    dispatches to ``batched_newton_schulz_step_tsyrk`` / ``batched_tsyrk_ex``, so the
+    arithmetic is the same per-matrix Newton-Schulz -- ``baddbmm``/batched-SYRK over a
+    leading batch dim rather than ``addmm``/SYRK once per matrix. No reassociation, same
+    coefficients, same step count, same SYRK path.
+
+    ``distributed`` is deliberately NOT batched. Its collective route runs
+    ``distributed_normalize_p2``, which reduces ``(x*x).sum()`` over the whole tensor; on a
+    3-D stack that would normalize all B matrices by one shared Frobenius norm, which is a
+    different computation, not a faster route to the same one.
+    """
+    if partition_dim is None:
+        # Replicated weight: nothing to gather, same non-TP fallback newton_schulz_tp takes.
+        return newton_schulz(x, steps, coefficient_type, use_syrk=use_syrk)
+    if tp_mode != "duplicated":
+        raise ValueError(f"batched Newton-Schulz supports tp_mode='duplicated' only, got {tp_mode!r}")
+    if partition_dim not in (0, 1):
+        raise ValueError(f"Invalid partition_dim: {partition_dim}")
+
+    x = x.contiguous()
+    world = tp_group.size()
+    batch, rows, cols = x.shape
+    # ONE aggregated, CONTIGUOUS all-gather for the whole stack. ``all_gather_into_tensor``
+    # gives NCCL a single flat destination, so the whole chunk moves in one ncclAllGather of
+    # ``batch`` x the per-matrix payload. The per-matrix path's list-based ``all_gather``
+    # instead gathers into a flat buffer AND copies out into ``world`` separate tensors,
+    # which ``torch.cat`` then copies a second time -- so this is one collective and one
+    # copy where the unbatched arm pays ``batch`` collectives and two copies each.
+    gathered = torch.empty((world, batch, rows, cols), dtype=x.dtype, device=x.device)
+    torch.distributed.all_gather_into_tensor(gathered, x, group=tp_group)
+    # Rank-major (W, B, r, c) -> the per-matrix concatenation along partition_dim, per
+    # matrix. +1 on the dim indices for the leading batch dim.
+    if partition_dim == 0:
+        global_x = gathered.permute(1, 0, 2, 3).reshape(batch, world * rows, cols)
+    else:
+        global_x = gathered.permute(1, 2, 0, 3).reshape(batch, rows, world * cols)
+    orthogonalized = newton_schulz(global_x, steps, coefficient_type, use_syrk=use_syrk)
+    return orthogonalized.chunk(world, dim=partition_dim + 1)[tp_group.rank()]
+
+
+def time_group(
+    stack, group, mode, steps, coefficient_type, iters, warmup, shard_count,
+    use_syrk=False, batched=False, batch_chunk=0,
+) -> float:
+    """Median wall-clock ms to orthogonalize a WHOLE same-shape group in one timed region.
+
+    ``stack`` is ``(count, rows, cols)``. The return value is the group's total, not a
+    per-matrix cost: it enters the profile total directly, so the composition stays
+    ``sum over owned groups`` exactly as the per-matrix path's ``median * count`` does.
+    """
+    partition_dim = None if shard_count == 1 else 0
+    count = stack.size(0)
+    chunk = batch_chunk if (batch_chunk and batch_chunk > 0) else count
+
+    if batched:
+        def once():
+            for start_index in range(0, count, chunk):
+                newton_schulz_tp_batched(
+                    stack[start_index : start_index + chunk],
+                    steps=steps,
+                    coefficient_type=coefficient_type,
+                    tp_group=group,
+                    partition_dim=partition_dim,
+                    tp_mode=mode,
+                    use_syrk=use_syrk,
+                )
+    else:
+        def once():
+            for index in range(count):
+                newton_schulz_tp(
+                    stack[index],
+                    steps=steps,
+                    coefficient_type=coefficient_type,
+                    tp_group=group,
+                    partition_dim=partition_dim,
+                    tp_mode=mode,
+                    use_syrk=use_syrk,
+                )
+
+    for _ in range(warmup):
+        once()
+    torch.cuda.synchronize()
+    torch.distributed.barrier(group=group)
+
+    timings = []
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    for _ in range(iters):
+        torch.distributed.barrier(group=group)
+        start.record()
+        once()
+        end.record()
+        torch.cuda.synchronize()
+        timings.append(start.elapsed_time(end))
+    return statistics.median(timings)
+
+
 def main() -> None:
     """Time every strategy on every distinct shape, then report per-profile and max."""
     parser = argparse.ArgumentParser(
@@ -296,6 +436,22 @@ def main() -> None:
     # the FLOP columns stay self-consistent -- but GF is then on a different cost model
     # than a GEMM-path run and must not be compared across the two.
     parser.add_argument("--use-syrk", action="store_true")
+    # Set-composed timing. Off by default so the legacy per-matrix composition -- and the
+    # numbers taken under it -- keep reproducing byte-for-byte.
+    parser.add_argument(
+        "--set-timing",
+        action="store_true",
+        help="Additionally time each owned same-shape GROUP inside one timed region: the "
+             "unbatched '<mode>_set' baseline arm and the batched 'duplicated_batch' arm. "
+             "When set, 'fastest step' is reported over the set-composed policies.",
+    )
+    parser.add_argument(
+        "--batch-chunk",
+        type=int,
+        default=64,
+        help="Matrices per batched Newton-Schulz call under --set-timing (0 = the whole "
+             "group at once). Bounds the resident all-gather buffer.",
+    )
     # Newton-Schulz requires fp32: it runs on Muon's momentum, which the optimizer keeps
     # in fp32 regardless of the parameter dtype. bf16 raises ValueError.
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "bfloat16"])
@@ -357,6 +513,12 @@ def main() -> None:
     if config.use_syrk:
         log("use_syrk=True: FLOP columns use the SYRK cost model (3m^2n + m^3 per step),")
         log("so GF is NOT comparable to a GEMM-path run; ms and TF/s are.")
+    if config.set_timing:
+        log(
+            f"set_timing=True: owned same-shape groups are also timed as a SET "
+            f"(batch_chunk={config.batch_chunk}). 'fastest step' is over the set-composed "
+            f"policies only."
+        )
     log("")
 
     dtype = torch.bfloat16 if config.dtype == "bfloat16" else torch.float32
@@ -443,9 +605,89 @@ def main() -> None:
     if best_mode_for_shape:
         policies.append(per_shape_policy)
 
+    # ----------------------------------------------------------------------------------
+    # Set-composed arms (--set-timing). See the block above ``time_group``.
+    # ----------------------------------------------------------------------------------
+    set_modes = [f"{mode}{SET_SUFFIX}" for mode in config.modes]
+    per_shape_set_policy = per_shape_policy + SET_SUFFIX
+    # group_ms[(matrix, count)][policy] is the WHOLE group's time, not a per-matrix cost.
+    group_ms: Dict[Tuple, Dict[str, float]] = {}
+    set_policies: List[str] = []
+    best_set_mode_for_shape: Dict[Tuple, str] = {}
+    if config.set_timing:
+        # Every (shape, owned count) pair that appears in any rank profile, timed once.
+        needed: Dict[Tuple, set] = {}
+        for signature in profiles:
+            for matrix, count in signature:
+                needed.setdefault(matrix, set()).add(count)
+
+        log("\nSET-COMPOSED  (whole owned group of one shape inside ONE timed region;")
+        log("               ms is the GROUP total, per-matrix = ms / count)")
+        set_header = f"{'local shard':>13}{'count':>7}{'policy':>19}{'group ms':>11}{'per-matrix ms':>15}"
+        log(set_header)
+        log("-" * len(set_header))
+        for matrix in distinct:
+            (rows, cols), shard_count = matrix
+            for count in sorted(needed.get(matrix, ())):
+                # One stack shared by both arms: the unbatched arm iterates its slices,
+                # the batched arm consumes it whole. Same data, same resident footprint.
+                stack = torch.randn((count, rows, cols), device="cuda", dtype=dtype)
+                entry: Dict[str, float] = {}
+                for mode in config.modes:
+                    entry[f"{mode}{SET_SUFFIX}"] = time_group(
+                        stack, group, mode, config.num_ns_steps, config.coefficient_type,
+                        config.iters, config.warmup, shard_count, config.use_syrk,
+                        batched=False,
+                    )
+                # Only ``duplicated`` is batched; see newton_schulz_tp_batched's docstring.
+                if "duplicated" in config.modes:
+                    entry[BATCH_POLICY] = time_group(
+                        stack, group, "duplicated", config.num_ns_steps,
+                        config.coefficient_type, config.iters, config.warmup, shard_count,
+                        config.use_syrk, batched=True, batch_chunk=config.batch_chunk,
+                    )
+                group_ms[(matrix, count)] = entry
+                for policy, ms in entry.items():
+                    log(
+                        f"{f'{rows}x{cols}':>13}{count:>7}{policy:>19}{ms:>11.3f}"
+                        f"{ms / count:>15.3f}"
+                    )
+                del stack
+                torch.cuda.empty_cache()
+
+        set_policies = list(set_modes)
+        if BATCH_POLICY in next(iter(group_ms.values()), {}):
+            set_policies.append(BATCH_POLICY)
+        if len(set_modes) > 1:
+            for matrix in distinct:
+                counts = sorted(needed.get(matrix, ()))
+                # Argmin on the per-matrix cost; identical across counts in practice, and
+                # the largest owned count is the one that dominates the profile total.
+                biggest = counts[-1]
+                best_set_mode_for_shape[matrix] = min(
+                    set_modes, key=lambda m: group_ms[(matrix, biggest)][m]
+                )
+            set_policies.append(per_shape_set_policy)
+        policies += set_policies
+
     def resolve(matrix, policy: str) -> str:
         """Mode a policy runs for one shape."""
-        return best_mode_for_shape[matrix] if policy == per_shape_policy else policy
+        if policy == per_shape_policy:
+            return best_mode_for_shape[matrix]
+        if policy == per_shape_set_policy:
+            return best_set_mode_for_shape[matrix]
+        return policy
+
+    def policy_mode(policy: str) -> str:
+        """The underlying tp_mode a policy runs, for the FLOP model."""
+        mode = policy[: -len(SET_SUFFIX)] if policy.endswith(SET_SUFFIX) else policy
+        return "duplicated" if policy == BATCH_POLICY else mode
+
+    def group_total(signature, policy: str) -> float:
+        """Profile total for one policy: the composition is 'sum over owned groups'."""
+        if policy in set_policies:
+            return sum(group_ms[(e, n)][resolve(e, policy)] for e, n in signature)
+        return sum(per_shape[e][resolve(e, policy)] * n for e, n in signature)
 
     if best_mode_for_shape:
         log("\nPER-SHAPE MODE SELECTION  (policy 'per_shape' runs this mode for this shape)")
@@ -468,7 +710,7 @@ def main() -> None:
     log("\nPER-PROFILE  (sum over the matrices that profile owns)")
     profile_header = f"{'ranks':>6}  {'owns':<38}"
     for policy in policies:
-        profile_header += f"{policy:>12}{'TF/s':>8}"
+        profile_header += f"{policy:>18}{'TF/s':>8}"
     log(profile_header)
     log("-" * len(profile_header))
     totals: Dict[str, List[float]] = {policy: [] for policy in policies}
@@ -477,17 +719,18 @@ def main() -> None:
         owns = " + ".join(f"{n}x[{e[0][0]}x{e[0][1]}]" for e, n in signature)
         line = f"{len(dp_ranks):>6}  {owns:<38}"
         for policy in policies:
-            total_ms = sum(per_shape[e][resolve(e, policy)] * n for e, n in signature)
+            total_ms = group_total(signature, policy)
             useful = sum(
                 flop_model(
-                    e, resolve(e, policy), config.num_ns_steps, group_size, config.use_syrk
+                    e, policy_mode(resolve(e, policy)), config.num_ns_steps, group_size,
+                    config.use_syrk,
                 )[1]
                 * n
                 for e, n in signature
             )
             totals[policy].append(total_ms)
             useful_totals[policy].append(useful)
-            line += f"{total_ms:>11.3f}m{useful / 1e9 / total_ms:>8.0f}"
+            line += f"{total_ms:>17.3f}m{useful / 1e9 / total_ms:>8.0f}"
         log(line)
 
     log("-" * len(profile_header))
@@ -495,24 +738,46 @@ def main() -> None:
     for policy in policies:
         slowest = max(range(len(totals[policy])), key=lambda i: totals[policy][i])
         step += (
-            f"{totals[policy][slowest]:>11.3f}m"
+            f"{totals[policy][slowest]:>17.3f}m"
             f"{useful_totals[policy][slowest] / 1e9 / totals[policy][slowest]:>8.0f}"
         )
     log(step)
     imbalance = f"{'':>6}  {'imbalance (max / mean)':<38}"
     for policy in policies:
         mean = sum(t * len(r) for t, r in zip(totals[policy], profiles.values())) / dp_size
-        imbalance += f"{max(totals[policy]) / mean:>11.2f}x{'':>8}"
+        imbalance += f"{max(totals[policy]) / mean:>17.2f}x{'':>8}"
     log(imbalance)
 
-    best = min(policies, key=lambda p: max(totals[p]))
-    log(f"\nfastest step: {best} ({max(totals[best]):.3f} ms)")
-    if best == per_shape_policy:
+    # Under --set-timing the two compositions are NOT interchangeable, so the reported
+    # step is taken over the set-composed policies only and the unbatched set-composed
+    # baseline is printed beside it. That is what keeps the batched arm from ever being
+    # credited with the composition change: both numbers come from the same job, over the
+    # same tensors, under the same composition.
+    if config.set_timing:
+        candidates = set_policies
+        baseline_pool = [p for p in set_policies if p != BATCH_POLICY]
+        baseline = min(baseline_pool, key=lambda p: max(totals[p]))
         log(
-            "  per_shape selection: "
-            + ", ".join(
-                f"{e[0][0] * e[1]}x{e[0][1]}={best_mode_for_shape[e]}" for e in distinct
-            )
+            f"\nset-composed baseline (unbatched): {baseline} "
+            f"({max(totals[baseline]):.3f} ms)"
+        )
+    else:
+        candidates = policies
+
+    best = min(candidates, key=lambda p: max(totals[p]))
+    log(f"\nfastest step: {best} ({max(totals[best]):.3f} ms)")
+    if best in (per_shape_policy, per_shape_set_policy):
+        selection = best_mode_for_shape if best == per_shape_policy else best_set_mode_for_shape
+        log(
+            f"  {best} selection: "
+            + ", ".join(f"{e[0][0] * e[1]}x{e[0][1]}={selection[e]}" for e in distinct)
+        )
+    if config.set_timing:
+        log(
+            f"  set-composed policies scored: {', '.join(candidates)}; "
+            f"batch_chunk={config.batch_chunk}. Isolated-composition columns "
+            f"({', '.join(policies[: len(policies) - len(set_policies)])}) are printed for "
+            "continuity and are NOT scored."
         )
     log("notes:")
     log("  useful TF/s already discounts redundancy. duplicated recomputes the whole matrix")

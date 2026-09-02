@@ -45,6 +45,13 @@ SYRK_OPTION=""
 if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 
 # The script sweeps every rank profile itself and reports the slowest, so nothing to pick.
+#
+# --set-timing: this axis owns 192 copies each of two expert shapes, so its cost is a
+# property of the SET, not of one matrix. It times the whole owned group inside one region
+# under two arms -- unbatched ('<mode>_set', the baseline) and batched ('duplicated_batch',
+# one all-gather + one batched Newton-Schulz per chunk) -- and scores 'fastest step' over
+# the set-composed policies. Both arms come from this one job, so the batched arm is never
+# credited with the composition change. --batch-chunk bounds the all-gather buffer.
 options=" \
     --group egtp \
     --modelled-world-size 128 \
@@ -53,6 +60,8 @@ options=" \
     --coefficient-type polar_express \
     --iters 20 \
     --warmup 5 \
+    --set-timing \
+    --batch-chunk 64 \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
