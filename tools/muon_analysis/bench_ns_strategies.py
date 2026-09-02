@@ -796,6 +796,289 @@ def newton_schulz_tp_subgroup(
     return result
 
 
+# --------------------------------------------------------------------------------------
+# Fused, CROSS-SHAPE subgroup exchange (--fuse-shape-exchanges).
+#
+# ``newton_schulz_tp_subgroup`` deals ONE shape's owned group across the k = world/g
+# subgroups and pays its own pair of ``all_to_all_single`` for it. A rank that owns five
+# distinct dense shapes therefore runs five independent subgroup regions back to back,
+# each with its own exchange and -- more importantly -- its own INDEPENDENT deal.
+#
+# This function fuses all of them into ONE region with ONE pair of exchanges. Two things
+# change, and they are deliberately separable so the measurement can attribute the delta:
+#
+#   1. THE EXCHANGE IS FUSED. Every shape's payload for a given peer is concatenated into
+#      that peer's slot of a single ``all_to_all_single``, so the region pays one pair of
+#      collectives instead of one pair per shape. Per-shape splits differ in size (and in
+#      g, since each shape may have banked a different duplication degree), which is
+#      exactly what ``input_split_sizes`` / ``output_split_sizes`` express. With
+#      ``balanced=False`` the OWNERSHIP is bit-for-bit the round-robin
+#      ``newton_schulz_tp_subgroup`` already uses (matrix j of shape i -> subgroup j % k),
+#      so this arm isolates the fused exchange and nothing else.
+#   2. WITH ``balanced=True``, THE DEAL IS ALSO POOLED ACROSS SHAPES. A per-shape deal
+#      strands work: a shape with 3 owned matrices dealt over k = 16 subgroups leaves 13
+#      subgroups idle for the whole region, and since the closing collective is a barrier
+#      in effect, the region costs one WHOLE matrix of Newton-Schulz no matter how few
+#      matrices it carries. That is what the measured data shows -- 10240x8192 at count 3
+#      costs 10.857 ms against a 10.260 ms single-matrix ``duplicated`` time, and is flat
+#      in g (10.857 / 10.738 / 10.910 at g = 4/8/16) precisely because every g leaves
+#      exactly one matrix per busy subgroup. Fusing the region makes those 3 stranded
+#      matrices absorbable: the pooled set is dealt by greedy LPT on ``ns_cost``, the same
+#      cost model and the same tie-breaking ``owned_matrices`` uses for the outer
+#      data-parallel assignment, so the region's makespan approaches the pooled mean
+#      instead of the sum of five independent maxima.
+#
+# NUMERICS ARE UNTOUCHED under both deals. Which subgroup owns which matrix is internal:
+# every matrix is still all-gathered in RANK order and orthogonalized WHOLE by exactly the
+# same ``newton_schulz`` call, same step count, same ``polar_express`` coefficients, same
+# SYRK path, and each shape's return value is still this rank's slice of every matrix in
+# INPUT order. Only the (subgroup -> matrix) assignment and the packing of the two
+# collectives change.
+# --------------------------------------------------------------------------------------
+
+FUSED_EXCHANGE_PREFIX = "fuse_sub_g"
+# Suffix for the pooled-LPT deal; without it the arm is the round-robin deal, i.e. the
+# fused exchange in isolation.
+BALANCED_SUFFIX = "_bal"
+# The scored policy: the accepted state with the subgroup-banked shapes' per-shape regions
+# replaced by ONE fused region. Shapes the reference did not bank on a subgroup arm are
+# untouched, so the policy can never re-bank anything the reference already chose.
+PER_SHAPE_FUSED_EXCHANGE_POLICY = "per_shape_fuse_sub_set"
+
+
+def fused_exchange_policy(subgroup_size: int, balanced: bool = False) -> str:
+    return (
+        f"{FUSED_EXCHANGE_PREFIX}{subgroup_size}" + (BALANCED_SUFFIX if balanced else "")
+    )
+
+
+def fused_subgroup_deal(full_shapes, counts, groups: int, balanced: bool):
+    """``owners[i][j]`` = subgroup owning matrix ``j`` of shape ``i``.
+
+    Pure arithmetic over shapes and counts, so it is IDENTICAL on every rank of the group
+    -- which is what keeps the two collectives in lockstep.
+    """
+    if not balanced:
+        # Exactly what newton_schulz_tp_subgroup does per shape today.
+        return [[j % groups for j in range(count)] for count in counts]
+    loads = [0] * groups
+    owners = [[0] * count for count in counts]
+    items = []
+    for index, ((rows, cols), count) in enumerate(zip(full_shapes, counts)):
+        big, small = max(rows, cols), min(rows, cols)
+        cost = big * small * small          # ns_cost of the full, all-gathered matrix
+        for j in range(count):
+            items.append((cost, index, j))
+    # Greedy LPT, ties broken by (shape, matrix) then by lowest subgroup id: deterministic.
+    for cost, index, j in sorted(items, key=lambda t: (-t[0], t[1], t[2])):
+        pick = min(range(groups), key=lambda s: (loads[s], s))
+        loads[pick] += cost
+        owners[index][j] = pick
+    return owners
+
+
+def newton_schulz_tp_subgroup_fused(
+    stacks: List[torch.Tensor],
+    steps: int,
+    coefficient_type: str,
+    tp_group,
+    use_syrk: bool = False,
+    subgroup_size: int = 0,
+    balanced: bool = False,
+) -> List[torch.Tensor]:
+    """Subgroup duplication over SEVERAL shapes at once, with one pair of exchanges.
+
+    ``stacks[i]`` is ``(count_i, rows_i, cols_i)``: the whole owned group of shape ``i``,
+    every matrix sharded on dim 0 across ``tp_group``. Returns a list of
+    ``(count_i, rows_i, cols_i)`` tensors -- this rank's slice of every matrix, in input
+    order -- i.e. exactly what calling ``newton_schulz_tp_subgroup`` once per shape
+    returns, only dealt and exchanged together.
+
+    Every precondition is a hard error rather than a silent fallback: an arm that quietly
+    ran the per-shape path would be scored for a mechanism it did not use.
+    """
+    world = tp_group.size()
+    rank = tp_group.rank()
+    if len(stacks) < 2:
+        raise ValueError(
+            "fused subgroup exchange is a CROSS-SHAPE fusion and needs >= 2 stacks, got "
+            f"{len(stacks)}"
+        )
+    if subgroup_size <= 0 or world % subgroup_size != 0:
+        raise ValueError(f"subgroup_size {subgroup_size} must divide world {world}")
+    groups = world // subgroup_size          # k
+    if groups == 1:
+        raise ValueError("subgroup_size == world is plain 'duplicated'")
+    dtype, device = stacks[0].dtype, stacks[0].device
+    for stack in stacks:
+        if stack.dim() != 3:
+            raise ValueError(f"each stack must be (count, rows, cols), got {tuple(stack.shape)}")
+        if stack.dtype is not dtype or stack.device != device:
+            raise ValueError("all stacks must share one dtype and device")
+    stacks = [stack.contiguous() for stack in stacks]
+
+    n_shapes = len(stacks)
+    counts = [stack.size(0) for stack in stacks]
+    dims = [(stack.size(1), stack.size(2)) for stack in stacks]
+    elems = [rows * cols for rows, cols in dims]
+    owners = fused_subgroup_deal(
+        [(rows * world, cols) for rows, cols in dims], counts, groups, balanced
+    )
+    my_sub = rank // subgroup_size           # s_r
+    my_slot = rank % subgroup_size           # i_r, this rank's send-duty slot
+    # owned[i][s]: the matrix indices of shape i that subgroup s owns, ascending.
+    owned = [
+        [[j for j in range(counts[i]) if owners[i][j] == s] for s in range(groups)]
+        for i in range(n_shapes)
+    ]
+    mine = [len(owned[i][my_sub]) for i in range(n_shapes)]
+
+    def sub_elems(sub: int) -> int:
+        """Elements one subgroup's whole (cross-shape) share occupies, per rank."""
+        return sum(len(owned[i][sub]) * elems[i] for i in range(n_shapes))
+
+    my_block = sub_elems(my_sub)
+
+    # ---- ONE input exchange over every shape ------------------------------------------
+    # Peer-major outer, shape-major inner: destination d gets, for each shape in order,
+    # this rank's shard of the matrices d's subgroup owns.
+    pieces = []
+    for d in range(world):
+        sub_d = d // subgroup_size
+        for i in range(n_shapes):
+            idx = owned[i][sub_d]
+            if idx:
+                pieces.append(stacks[i][idx].reshape(-1))
+    send = torch.cat(pieces) if pieces else torch.empty(0, dtype=dtype, device=device)
+    del pieces
+    recv = torch.empty(world * my_block, dtype=dtype, device=device)
+    torch.distributed.all_to_all_single(
+        recv,
+        send,
+        output_split_sizes=[my_block] * world,
+        input_split_sizes=[sub_elems(d // subgroup_size) for d in range(world)],
+        group=tp_group,
+    )
+    del send
+
+    # ---- compute: the SAME per-matrix newton_schulz, on this subgroup's pooled share ---
+    recv_2d = recv.view(world, my_block)
+    results = [
+        torch.empty((counts[i], dims[i][0], dims[i][1]), dtype=dtype, device=device)
+        for i in range(n_shapes)
+    ]
+    full: List[List[torch.Tensor]] = []
+    offset = 0
+    for i in range(n_shapes):
+        rows, cols = dims[i]
+        span = mine[i] * elems[i]
+        if span == 0:
+            full.append([])
+            continue
+        # (src, matrix, rows, cols) -> per matrix the shards concatenated in RANK order,
+        # which is what duplicated's all_gather + cat(dim=partition_dim) produces.
+        global_x = (
+            recv_2d[:, offset : offset + span]
+            .reshape(world, mine[i], rows, cols)
+            .permute(1, 0, 2, 3)
+            .reshape(mine[i], world * rows, cols)
+        )
+        offset += span
+        full.append([
+            newton_schulz(global_x[m], steps, coefficient_type, use_syrk=use_syrk)
+            for m in range(mine[i])
+        ])
+        del global_x
+    del recv_2d, recv
+
+    # ---- ONE output exchange over every shape -----------------------------------------
+    # This rank serves destinations d with d % subgroup_size == my_slot: k of them, each
+    # getting every owned matrix's row block d, for every shape, in the same order the
+    # receiver parses.
+    pieces = []
+    for d in range(world):
+        if d % subgroup_size != my_slot:
+            continue
+        for i in range(n_shapes):
+            if not full[i]:
+                continue
+            rows = dims[i][0]
+            pieces.append(
+                torch.stack([y[d * rows : (d + 1) * rows] for y in full[i]]).reshape(-1)
+            )
+    send_out = torch.cat(pieces) if pieces else torch.empty(0, dtype=dtype, device=device)
+    del pieces, full
+    out = torch.empty(
+        sum(counts[i] * elems[i] for i in range(n_shapes)), dtype=dtype, device=device
+    )
+    torch.distributed.all_to_all_single(
+        out,
+        send_out,
+        # Received from src = s * subgroup_size + my_slot for s = 0..k-1, ascending, so the
+        # blocks arrive in subgroup order and, inside each, in shape order.
+        output_split_sizes=[
+            sub_elems(src // subgroup_size) if src % subgroup_size == my_slot else 0
+            for src in range(world)
+        ],
+        input_split_sizes=[
+            my_block if d % subgroup_size == my_slot else 0 for d in range(world)
+        ],
+        group=tp_group,
+    )
+    del send_out
+    cursor = 0
+    for s in range(groups):
+        for i in range(n_shapes):
+            idx = owned[i][s]
+            if not idx:
+                continue
+            rows, cols = dims[i]
+            span = len(idx) * elems[i]
+            results[i][idx] = out[cursor : cursor + span].view(len(idx), rows, cols)
+            cursor += span
+    return results
+
+
+def time_fused_group(
+    stacks, group, steps, coefficient_type, iters, warmup, use_syrk=False,
+    subgroup_size=0, balanced=False,
+) -> float:
+    """Median wall-clock ms for ONE fused region spanning several owned shape groups.
+
+    The return value is the whole region's total. It replaces the SUM of the per-shape
+    regions it fuses, which is why the composition change is explicit: a fused row is
+    reported per RANK PROFILE, never re-attributed to one shape.
+    """
+
+    def once():
+        newton_schulz_tp_subgroup_fused(
+            stacks,
+            steps=steps,
+            coefficient_type=coefficient_type,
+            tp_group=group,
+            use_syrk=use_syrk,
+            subgroup_size=subgroup_size,
+            balanced=balanced,
+        )
+
+    for _ in range(warmup):
+        once()
+    torch.cuda.synchronize()
+    torch.distributed.barrier(group=group)
+
+    timings = []
+    start, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    for _ in range(iters):
+        torch.distributed.barrier(group=group)
+        start.record()
+        once()
+        end.record()
+        torch.cuda.synchronize()
+        timings.append(start.elapsed_time(end))
+    return statistics.median(timings)
+
+
+
 def time_group(
     stack, group, mode, steps, coefficient_type, iters, warmup, shard_count,
     use_syrk=False, batched=False, batch_chunk=0, subgroup_size=0, fused=False,
@@ -976,6 +1259,22 @@ def main() -> None:
              "many windows, each with its own pair of exchanges. Raises the collective "
              "count per region from 2 to 2*N (at alpha_ib = 75.681 us, +0.45 ms/region at "
              "N = 4), so keep it small; N = 1 degenerates to no overlap.",
+    )
+    parser.add_argument(
+        "--fuse-shape-exchanges",
+        action="store_true",
+        help="Under --set-timing with --subgroup-sizes, ALSO time the owned shapes whose "
+             "banked arm is a subgroup column as ONE fused region with ONE pair of "
+             f"all_to_all_single ('{FUSED_EXCHANGE_PREFIX}<g>' = the same round-robin deal, "
+             f"exchange fused only; '{FUSED_EXCHANGE_PREFIX}<g>{BALANCED_SUFFIX}' = the "
+             "deal also pooled across shapes by greedy LPT on ns_cost), and score "
+             f"'{PER_SHAPE_FUSED_EXCHANGE_POLICY}' against the accepted state. Identical "
+             "math -- every matrix is still all-gathered in rank order and orthogonalized "
+             "whole by the same newton_schulz, same 5 steps, same coefficients, same SYRK "
+             "path; only which subgroup owns which matrix and how the two collectives are "
+             "packed change. The fused region is timed and reported PER RANK PROFILE, "
+             "since which shapes it spans is a property of the profile. Off by default, "
+             "so without it the scored policy set is byte-identical to before.",
     )
     parser.add_argument(
         "--batch-replicated-shapes",
@@ -1211,6 +1510,12 @@ def main() -> None:
     best_batch_subgroup_fused_for_shape: Dict[Tuple, str] = {}
     best_batch_subgroup_pipe_for_shape: Dict[Tuple, str] = {}
     pipe_reference_policy = PER_SHAPE_BATCH_SUBGROUP_POLICY
+    # Cross-shape exchange fusion (--fuse-shape-exchanges). Unlike every other arm this is
+    # a PER-PROFILE region, not a per-shape column, so it lives in its own maps.
+    fused_region_ms: Dict[Tuple, Dict[str, float]] = {}
+    fuse_shapes: Dict[Tuple, List[Tuple]] = {}
+    fuse_reference_policy = None
+    fuse_arm = None
     fused_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     pipe_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
@@ -1537,6 +1842,12 @@ def main() -> None:
             return best_batch_subgroup_fused_for_shape[matrix]
         if policy == PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY:
             return best_batch_subgroup_pipe_for_shape[matrix]
+        if policy == PER_SHAPE_FUSED_EXCHANGE_POLICY:
+            # The fusion never changes WHICH arm a shape runs -- it only merges the
+            # regions of the shapes the reference already banked on a subgroup arm -- so
+            # per shape it resolves to exactly the reference's arm. That is also what
+            # keeps the FLOP model identical between the two.
+            return resolve(matrix, fuse_reference_policy)
         return policy
 
     def policy_mode(policy: str) -> str:
@@ -1557,9 +1868,153 @@ def main() -> None:
 
     def group_total(signature, policy: str) -> float:
         """Profile total for one policy: the composition is 'sum over owned groups'."""
+        if policy == PER_SHAPE_FUSED_EXCHANGE_POLICY:
+            # Composition: ONE fused region for the shapes it spans, plus the reference's
+            # own regions for every shape it does not. Never re-attributed to a shape.
+            fused = fuse_shapes.get(signature, [])
+            fused_ms = fused_region_ms.get(signature, {}).get(fuse_arm)
+            if len(fused) < 2 or fused_ms is None:
+                return group_total(signature, fuse_reference_policy)
+            spanned = set(fused)
+            return fused_ms + sum(
+                group_ms[(e, n)][resolve(e, fuse_reference_policy)]
+                for e, n in signature
+                if (e, n) not in spanned
+            )
         if policy in set_policies:
             return sum(group_ms[(e, n)][resolve(e, policy)] for e, n in signature)
         return sum(per_shape[e][resolve(e, policy)] * n for e, n in signature)
+
+
+    # ----------------------------------------------------------------------------------
+    # Fused cross-shape subgroup region (--fuse-shape-exchanges).
+    #
+    # This block runs AFTER the per-shape selection because WHICH shapes it fuses is
+    # defined by the reference: exactly the shapes whose banked arm is a subgroup column.
+    # A shape the reference banked on anything else (duplicated_batch, distributed_set,
+    # ...) is untouched, so the policy cannot be credited with a win the reference already
+    # made -- what it changes is the number of exchanges and the deal, nothing else.
+    #
+    # The region is per RANK PROFILE, not per shape: a profile's fused set is the set of
+    # shapes IT owns. Both are timed by all ranks in the same job, over the same tensors,
+    # under the same composition, and the SET-COMPOSED table gains its own fused rows
+    # rather than any time being re-attributed to one shape.
+    # ----------------------------------------------------------------------------------
+    if config.set_timing and config.fuse_shape_exchanges:
+        for _candidate in (
+            PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY,
+            PER_SHAPE_SUBGROUP_ALL_POLICY,
+            PER_SHAPE_SUBGROUP_POLICY,
+        ):
+            if _candidate in set_policies:
+                fuse_reference_policy = _candidate
+                break
+        if fuse_reference_policy is None:
+            log(
+                "\nfuse_shape_exchanges=True but no subgroup policy was scored (needs "
+                "--set-timing and --subgroup-sizes); skipping "
+                f"'{PER_SHAPE_FUSED_EXCHANGE_POLICY}' rather than scoring it against an "
+                "ambiguous reference."
+            )
+        else:
+            for signature in profiles:
+                fuse_shapes[signature] = [
+                    (e, n) for e, n in signature
+                    if resolve(e, fuse_reference_policy).startswith(SUBGROUP_PREFIX)
+                ]
+            if not any(len(v) >= 2 for v in fuse_shapes.values()):
+                log(
+                    "\nfuse_shape_exchanges=True but no rank profile banks a subgroup arm "
+                    f"on 2+ shapes under '{fuse_reference_policy}'; there is nothing to "
+                    f"fuse, so '{PER_SHAPE_FUSED_EXCHANGE_POLICY}' is not scored."
+                )
+                fuse_shapes = {}
+            else:
+                log(
+                    f"\nFUSED-EXCHANGE  (per RANK PROFILE: the shapes '{fuse_reference_policy}'"
+                    " banked on a subgroup"
+                )
+                log(
+                    "                 arm, run as ONE region with ONE pair of "
+                    "all_to_all_single. '_bal' also"
+                )
+                log(
+                    "                 pools the DEAL across those shapes by greedy LPT on "
+                    "ns_cost.)"
+                )
+                fused_header = (
+                    f"  {'profile':>8}{'shapes':>8}{'matrices':>10}{'arm':>16}"
+                    f"{'fused ms':>11}{'per-shape sum ms':>18}{'delta ms':>11}"
+                )
+                log(fused_header)
+                log("  " + "-" * (len(fused_header) - 2))
+                for p_index, signature in enumerate(
+                    sorted(profiles, key=lambda s: -len(profiles[s]))
+                ):
+                    fused = fuse_shapes[signature]
+                    if len(fused) < 2:
+                        log(f"  {p_index:>8}{len(fused):>8}  <2 fusable shapes; not fused")
+                        continue
+                    reference_sum = sum(
+                        group_ms[(e, n)][resolve(e, fuse_reference_policy)] for e, n in fused
+                    )
+                    stacks = [
+                        torch.randn((n, e[0][0], e[0][1]), device="cuda", dtype=dtype)
+                        for e, n in fused
+                    ]
+                    entry: Dict[str, float] = {}
+                    for g in subgroup_sizes:
+                        for balanced in (False, True):
+                            arm = fused_exchange_policy(g, balanced)
+                            entry[arm] = time_fused_group(
+                                stacks, group, config.num_ns_steps,
+                                config.coefficient_type, config.iters, config.warmup,
+                                config.use_syrk, subgroup_size=g, balanced=balanced,
+                            )
+                            log(
+                                f"  {p_index:>8}{len(fused):>8}"
+                                f"{sum(n for _, n in fused):>10}{arm:>16}"
+                                f"{entry[arm]:>11.3f}{reference_sum:>18.3f}"
+                                f"{entry[arm] - reference_sum:>+11.3f}"
+                            )
+                            torch.cuda.empty_cache()
+                    fused_region_ms[signature] = entry
+                    del stacks
+                    torch.cuda.empty_cache()
+                # ONE global arm for the policy -- never a per-profile cherry-pick -- chosen
+                # by the same criterion the step cost uses: the max over rank profiles.
+                arm_names = sorted(
+                    set.intersection(*(set(v) for v in fused_region_ms.values()))
+                )
+                scored = {}
+                for arm in arm_names:
+                    fuse_arm = arm
+                    scored[arm] = max(
+                        group_total(sig, PER_SHAPE_FUSED_EXCHANGE_POLICY) for sig in profiles
+                    )
+                fuse_arm = min(arm_names, key=lambda a: scored[a])
+                log(
+                    f"  fused arm scored: "
+                    + ", ".join(f"{a}={scored[a]:.3f}" for a in arm_names)
+                    + f"  -> selected {fuse_arm}"
+                )
+                # Substitution discipline, asserted rather than assumed: the fused region
+                # may only span shapes the reference banked on a subgroup arm, and every
+                # shape it does NOT span must keep the reference's arm exactly.
+                for signature in profiles:
+                    spanned = set(fuse_shapes.get(signature, []))
+                    for e, n in signature:
+                        ref_arm = resolve(e, fuse_reference_policy)
+                        if (e, n) in spanned:
+                            assert ref_arm.startswith(SUBGROUP_PREFIX), (
+                                f"fused region spans {e} whose reference arm is {ref_arm}"
+                            )
+                        else:
+                            assert resolve(e, PER_SHAPE_FUSED_EXCHANGE_POLICY) == ref_arm, (
+                                f"unfused shape {e} re-banked away from {ref_arm}"
+                            )
+                set_policies.append(PER_SHAPE_FUSED_EXCHANGE_POLICY)
+                policies.append(PER_SHAPE_FUSED_EXCHANGE_POLICY)
 
     if best_mode_for_shape:
         log("\nPER-SHAPE MODE SELECTION  (policy 'per_shape' runs this mode for this shape)")
@@ -1637,11 +2092,14 @@ def main() -> None:
                          PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY, PER_SHAPE_BATCH_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
-                         PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY)
+                         PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY,
+                         PER_SHAPE_FUSED_EXCHANGE_POLICY)
             and not p.startswith(SUBGROUP_PREFIX)
             and not p.startswith(BATCH_SUBGROUP_PREFIX)
+            and not p.startswith(FUSED_EXCHANGE_PREFIX)
             and not p.endswith(FUSED_SUFFIX)
             and not p.endswith(PIPE_SUFFIX)
+            and not p.endswith(BALANCED_SUFFIX)
         ]
         baseline = min(baseline_pool, key=lambda p: max(totals[p]))
         log(
@@ -1854,6 +2312,64 @@ def main() -> None:
                         f"pipelined arm {p_sel} banked on {e} whose reference arm is "
                         f"{resolve(e, pipe_reference_policy)}"
                     )
+        if PER_SHAPE_FUSED_EXCHANGE_POLICY in totals:
+            ref = max(totals[fuse_reference_policy])
+            cand = max(totals[PER_SHAPE_FUSED_EXCHANGE_POLICY])
+            log(
+                f"\nexchange-fusion reference arm: {fuse_reference_policy} "
+                f"({ref:.3f} ms)  <- the ACCEPTED state"
+            )
+            log(
+                f"exchange-fusion candidate arm: {PER_SHAPE_FUSED_EXCHANGE_POLICY} "
+                f"({cand:.3f} ms) at {fuse_arm}, delta vs {fuse_reference_policy} = "
+                f"{cand - ref:+.3f} ms, delta vs {baseline} = "
+                f"{cand - max(totals[baseline]):+.3f} ms"
+            )
+            # BOTH rank profiles are printed, with the fused region broken out against the
+            # per-shape sum it replaces, so a negative outcome is diagnosable rather than
+            # merely negative: an exchange-only win shows up on the non-'_bal' arms, a
+            # deal win only on the '_bal' ones.
+            log(
+                "  exchange-fusion per-profile audit (fused region vs the per-shape "
+                "regions it replaces):"
+            )
+            log(
+                f"  {'profile':>8}{'ranks':>7}{'fused shapes':>50}"
+                f"{'per-shape sum':>15}{'fused':>10}{'delta':>10}{'profile total':>15}"
+            )
+            for p_index, signature in enumerate(
+                sorted(profiles, key=lambda s: -len(profiles[s]))
+            ):
+                fused = fuse_shapes.get(signature, [])
+                spanned = ", ".join(f"{n}x[{e[0][0] * e[1]}x{e[0][1]}]" for e, n in fused)
+                fused_ms = fused_region_ms.get(signature, {}).get(fuse_arm)
+                reference_sum = sum(
+                    group_ms[(e, n)][resolve(e, fuse_reference_policy)] for e, n in fused
+                )
+                total_ms = group_total(signature, PER_SHAPE_FUSED_EXCHANGE_POLICY)
+                if fused_ms is None or len(fused) < 2:
+                    log(
+                        f"  {p_index:>8}{len(profiles[signature]):>7}{spanned:>50}"
+                        f"{'not fused':>15}{'-':>10}{'-':>10}{total_ms:>15.3f}"
+                    )
+                    continue
+                log(
+                    f"  {p_index:>8}{len(profiles[signature]):>7}{spanned:>50}"
+                    f"{reference_sum:>15.3f}{fused_ms:>10.3f}"
+                    f"{fused_ms - reference_sum:>+10.3f}{total_ms:>15.3f}"
+                )
+            # Every arm, every profile: the full table the plan asked the verifier to see.
+            log("  exchange-fusion all-arm table (fused region ms):")
+            for p_index, signature in enumerate(
+                sorted(profiles, key=lambda s: -len(profiles[s]))
+            ):
+                entry = fused_region_ms.get(signature)
+                if not entry:
+                    continue
+                log(
+                    f"    profile {p_index}: "
+                    + ", ".join(f"{a}={entry[a]:.3f}" for a in sorted(entry))
+                )
     else:
         candidates = policies
 
@@ -1863,7 +2379,8 @@ def main() -> None:
                 PER_SHAPE_SUBGROUP_ALL_POLICY, PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY,
                 PER_SHAPE_BATCH_POLICY, PER_SHAPE_BATCH_SUBGROUP_POLICY,
                 PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
-                PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY):
+                PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY,
+                PER_SHAPE_FUSED_EXCHANGE_POLICY):
         selection = {
             per_shape_policy: best_mode_for_shape,
             per_shape_set_policy: best_set_mode_for_shape,
@@ -1874,11 +2391,22 @@ def main() -> None:
             PER_SHAPE_BATCH_SUBGROUP_POLICY: best_batch_subgroup_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY: best_batch_subgroup_fused_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY: best_batch_subgroup_pipe_for_shape,
+            # The fusion changes no per-shape arm; it merges regions. Reported as the
+            # reference's own selection plus the fused arm, printed below.
+            PER_SHAPE_FUSED_EXCHANGE_POLICY: {
+                e: resolve(e, PER_SHAPE_FUSED_EXCHANGE_POLICY) for e in distinct
+            } if fuse_reference_policy else {},
         }[best]
         log(
             f"  {best} selection: "
             + ", ".join(f"{e[0][0] * e[1]}x{e[0][1]}={selection[e]}" for e in distinct)
         )
+        if best == PER_SHAPE_FUSED_EXCHANGE_POLICY:
+            log(
+                f"  {best} fused arm: {fuse_arm}; the listed per-shape arms are the "
+                f"reference's ({fuse_reference_policy}) and are unchanged -- the shapes "
+                "marked with a subgroup arm run inside ONE fused region per profile."
+            )
     if config.set_timing:
         log(
             f"  set-composed policies scored: {', '.join(candidates)}; "

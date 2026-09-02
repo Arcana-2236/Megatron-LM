@@ -86,6 +86,26 @@ SUBGROUP_SIZES=${SUBGROUP_SIZES:-"4 8 16"}
 # partition_dim is None the batched call short-circuits to plain newton_schulz, so the
 # 'distributed' route -- whose distributed_normalize_p2 would share one Frobenius norm
 # across a 3-D stack -- is never reached. Sharded shapes keep their existing arms.
+#
+# --fuse-shape-exchanges: scores a FOURTH set-composed policy, 'per_shape_fuse_sub_set'.
+# Every shape the accepted state banked on a subgroup arm today pays its OWN pair of
+# all_to_all_single AND its own independent deal, and the deal is what costs: a shape with
+# 3 owned matrices dealt over k = world/g subgroups leaves k-3 subgroups idle for a whole
+# region, so the region costs one WHOLE matrix of Newton-Schulz however few matrices it
+# carries (10240x8192 at count 3 measured 10.857 ms against a 10.260 ms single-matrix
+# duplicated time, and was FLAT in g at 10.857 / 10.738 / 10.910 for g = 4/8/16, which is
+# the signature of exactly one matrix per busy subgroup at every g). This policy runs those
+# shapes as ONE region with ONE pair of exchanges, and times two deals side by side so the
+# delta is attributable: 'fuse_sub_g<g>' keeps the per-shape round-robin ownership (the
+# fused exchange in isolation) and 'fuse_sub_g<g>_bal' also pools the deal across shapes by
+# greedy LPT on ns_cost (the stranded matrices get absorbed). Numerics are untouched under
+# both: every matrix is still all-gathered in RANK order and orthogonalized WHOLE by the
+# same newton_schulz, same 5 steps, same polar_express coefficients, same SYRK path, and
+# each shape still returns this rank's slice of every matrix in INPUT order. Shapes the
+# accepted state did NOT bank on a subgroup arm (the shard_count == 1 shapes, which run
+# 'duplicated_batch') are untouched and asserted so. Because which shapes a fused region
+# spans is a property of the RANK PROFILE, the fused rows are reported per profile and
+# never re-attributed to one shape.
 options=" \
     --group gtp \
     --modelled-world-size 128 \
@@ -99,6 +119,7 @@ options=" \
     --subgroup-sizes ${SUBGROUP_SIZES} \
     --subgroup-all-shapes \
     --batch-replicated-shapes \
+    --fuse-shape-exchanges \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
