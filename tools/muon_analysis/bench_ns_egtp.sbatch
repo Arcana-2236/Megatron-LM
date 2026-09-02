@@ -63,6 +63,18 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 #
 # The script sweeps every rank profile itself and reports the slowest, so nothing to pick.
 #
+# --fused-ns-kernel: times each batched-subgroup column a SECOND time with the fused
+# Newton-Schulz entry point from dist_muon_opt/kernels/fused_ns.py, and scores
+# 'per_shape_batch_sub_fused_set' against the accepted 'per_shape_batch_sub_set'. Identical
+# math -- same 5 steps, same polar_express coefficients, same batched Triton SYRK path --
+# with the fp32 Frobenius-normalize + bf16 cast prologue and the bf16->fp32 cast + store
+# epilogue that wrap the chain collapsed into two Triton passes each. Measured composition
+# of the unfused region on this hardware (dist_muon_opt/stage-3/phase-2-egtp-ns-step-fusion,
+# job 2882597): of 34.7-37.7 ms of compute per region, 28.1 ms is the GEMM chain, 6.6 ms is
+# exactly those prologue/epilogue passes, and the tall shape pays a further ~3.0 ms because
+# its store is strided. Both arms come from THIS one job over the SAME tensors under the
+# SAME composition.
+#
 # --set-timing: this axis owns 192 copies each of two expert shapes, so its cost is a
 # property of the SET, not of one matrix. It times the whole owned group inside one region
 # under two arms -- unbatched ('<mode>_set', the baseline) and batched ('duplicated_batch',
@@ -81,6 +93,7 @@ options=" \
     --batch-chunk 64 \
     --subgroup-sizes ${EGTP_SUBGROUP_SIZES:-1} \
     --subgroup-batched \
+    --fused-ns-kernel \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
