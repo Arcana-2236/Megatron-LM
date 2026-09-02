@@ -18,6 +18,11 @@ Which wins depends on the matrix shape, the group size, and whether the group si
 inside an NVLink domain. This measures that directly, on the shapes a given rank
 actually owns.
 
+``duplicated`` and ``distributed`` are also the two corners of one continuous knob -- how
+many ranks redundantly orthogonalize the same matrix -- and ``--subgroup-sizes`` (under
+``--set-timing``) measures the interior: the owned set of a shape dealt across
+``world_size / g`` disjoint duplication subgroups. See ``newton_schulz_tp_subgroup``.
+
 Two axes are worth measuring separately:
 
   --group gtp    dense weights, sharded ``GTP`` ways. On GB200 a 64-rank GTP group fits
@@ -348,9 +353,161 @@ def newton_schulz_tp_batched(
     return orthogonalized.chunk(world, dim=partition_dim + 1)[tp_group.rank()]
 
 
+# --------------------------------------------------------------------------------------
+# Subgroup duplication (--subgroup-sizes)
+#
+# ``duplicated`` and ``distributed`` are the two CORNERS of one knob: how many ranks
+# redundantly orthogonalize the same matrix. ``duplicated`` sets that duplication group to
+# the whole TP group (all ``world`` ranks recompute every matrix, redundancy = world);
+# ``distributed`` sets it to 1 but pays ``steps`` all-reduces and keeps a replicated
+# ``A @ A`` term. Nothing forces the group to be one of those two values.
+#
+# With g < world the ``world`` ranks split into ``k = world / g`` subgroups and the owned
+# same-shape SET is dealt round-robin across them: subgroup s orthogonalizes matrices
+# ``s, s+k, s+2k, ...`` and no other. Per rank the arithmetic falls by ~k because it runs
+# ~count/k matrices instead of count -- each of them still whole, by exactly the same
+# ``newton_schulz`` call ``duplicated`` makes, so the numerics are unchanged.
+#
+# Two collectives realize it, both over the FULL group (the shards live on all ``world``
+# ranks no matter how the work is partitioned, so a subgroup-local collective could not
+# reach them). Both are ``all_to_all_single``, which is the shape of this exchange:
+#
+#   input   every rank sends its own shard of the matrices that belong to the RECEIVER's
+#           subgroup. Per-rank ingress is ``count/k`` gathered matrices rather than
+#           ``count`` -- a k-fold reduction of the volume ``duplicated``'s per-matrix
+#           all_gather moves, not a k-fold increase. Volume, written down before coding:
+#           egress = ingress = (world-1)/world x count/k x world x shard_bytes.
+#   output  each rank of a subgroup is the designated sender for ``k`` of the ``world``
+#           destinations (``d % g == rank % g``), and ships them their row-slice of the
+#           subgroup's matrices. This is the only NEW traffic: count x shard_bytes per
+#           rank each way, ~1/63 of what the input side saves.
+#
+# This is a POLICY over the existing kernels, not a new kernel: same ``newton_schulz``,
+# same 2-D call per matrix, same coefficients, same step count, same SYRK path.
+# --------------------------------------------------------------------------------------
+
+SUBGROUP_PREFIX = "duplicated_sub_g"
+PER_SHAPE_SUBGROUP_POLICY = "per_shape_sub_set"
+
+
+def subgroup_policy(subgroup_size: int) -> str:
+    return f"{SUBGROUP_PREFIX}{subgroup_size}"
+
+
+def newton_schulz_tp_subgroup(
+    stack: torch.Tensor,
+    steps: int,
+    coefficient_type: str,
+    tp_group,
+    partition_dim: int | None,
+    tp_mode: str,
+    use_syrk: bool = False,
+    subgroup_size: int = 0,
+) -> torch.Tensor:
+    """``duplicated`` over ``world/subgroup_size`` disjoint subgroups of the owned set.
+
+    ``stack`` is ``(count, rows, cols)``: the whole owned group of ONE shape, each matrix
+    sharded the same way across ``tp_group``. Returns ``(count, rows, cols)``: this rank's
+    slice of every matrix, in the input order -- i.e. exactly what looping
+    ``newton_schulz_tp(stack[j], tp_mode="duplicated")`` returns, stacked.
+
+    Only ``partition_dim == 0`` is supported, which is the axis this benchmark shards on.
+    """
+    if tp_mode != "duplicated":
+        raise ValueError(f"subgroup duplication is a 'duplicated' variant, got {tp_mode!r}")
+    if partition_dim is None:
+        # Replicated weight: no shards to redistribute, so there is no duplication group to
+        # shrink. Same non-TP fallback newton_schulz_tp takes.
+        return torch.stack([
+            newton_schulz(stack[j], steps, coefficient_type, use_syrk=use_syrk)
+            for j in range(stack.size(0))
+        ])
+    if partition_dim != 0:
+        raise ValueError(f"subgroup duplication supports partition_dim=0, got {partition_dim}")
+
+    world = tp_group.size()
+    rank = tp_group.rank()
+    if subgroup_size <= 0 or world % subgroup_size != 0:
+        raise ValueError(f"subgroup_size {subgroup_size} must divide world {world}")
+    groups = world // subgroup_size          # k
+    if groups == 1:
+        raise ValueError("subgroup_size == world is plain 'duplicated'")
+
+    stack = stack.contiguous()
+    count, rows, cols = stack.shape
+    my_sub = rank // subgroup_size           # s_r
+    my_slot = rank % subgroup_size           # i_r, this rank's send-duty slot
+    # Matrix j belongs to subgroup j % k, so subgroup s owns stack[s::k].
+    owned = [(count - s + groups - 1) // groups for s in range(groups)]
+    mine = owned[my_sub]
+
+    # ---- input exchange: give each subgroup every shard of the matrices it owns --------
+    send = torch.cat(
+        [stack[d // subgroup_size :: groups].reshape(-1, cols) for d in range(world)]
+    )
+    recv = torch.empty((world * mine * rows, cols), dtype=stack.dtype, device=stack.device)
+    torch.distributed.all_to_all_single(
+        recv,
+        send,
+        output_split_sizes=[mine * rows] * world,
+        input_split_sizes=[owned[d // subgroup_size] * rows for d in range(world)],
+        group=tp_group,
+    )
+    del send
+    # (src, matrix, rows, cols) -> per matrix, the shards concatenated in rank order, which
+    # is what duplicated's ``all_gather`` + ``cat(dim=partition_dim)`` produces.
+    global_x = recv.view(world, mine, rows, cols).permute(1, 0, 2, 3).reshape(
+        mine, world * rows, cols
+    )
+
+    # ---- compute: the SAME 2-D newton_schulz duplicated runs, on 1/k as many matrices ---
+    full = [
+        newton_schulz(global_x[m], steps, coefficient_type, use_syrk=use_syrk)
+        for m in range(mine)
+    ]
+    del recv, global_x
+
+    # ---- output exchange: hand every rank its row-slice of every matrix ----------------
+    # This rank serves destinations ``d`` with ``d % subgroup_size == my_slot``: k of them,
+    # one per (destination subgroup), each getting ``mine`` slices of ``rows`` rows.
+    if full:
+        send_out = torch.cat(
+            [
+                torch.stack([y[d * rows : (d + 1) * rows] for y in full]).reshape(-1, cols)
+                for d in range(my_slot, world, subgroup_size)
+            ]
+        )
+    else:
+        send_out = torch.empty((0, cols), dtype=stack.dtype, device=stack.device)
+    del full
+    out = torch.empty((count * rows, cols), dtype=stack.dtype, device=stack.device)
+    torch.distributed.all_to_all_single(
+        out,
+        send_out,
+        # Received from src = s * subgroup_size + my_slot for s = 0..k-1, ascending, so the
+        # blocks arrive in subgroup order: owned[0] matrices, then owned[1], ...
+        output_split_sizes=[
+            owned[src // subgroup_size] * rows if src % subgroup_size == my_slot else 0
+            for src in range(world)
+        ],
+        input_split_sizes=[
+            mine * rows if d % subgroup_size == my_slot else 0 for d in range(world)
+        ],
+        group=tp_group,
+    )
+    del send_out
+    result = torch.empty((count, rows, cols), dtype=stack.dtype, device=stack.device)
+    offset = 0
+    for s in range(groups):
+        block = out[offset : offset + owned[s] * rows].view(owned[s], rows, cols)
+        result[s::groups] = block
+        offset += owned[s] * rows
+    return result
+
+
 def time_group(
     stack, group, mode, steps, coefficient_type, iters, warmup, shard_count,
-    use_syrk=False, batched=False, batch_chunk=0,
+    use_syrk=False, batched=False, batch_chunk=0, subgroup_size=0,
 ) -> float:
     """Median wall-clock ms to orthogonalize a WHOLE same-shape group in one timed region.
 
@@ -362,7 +519,19 @@ def time_group(
     count = stack.size(0)
     chunk = batch_chunk if (batch_chunk and batch_chunk > 0) else count
 
-    if batched:
+    if subgroup_size:
+        def once():
+            newton_schulz_tp_subgroup(
+                stack,
+                steps=steps,
+                coefficient_type=coefficient_type,
+                tp_group=group,
+                partition_dim=partition_dim,
+                tp_mode=mode,
+                use_syrk=use_syrk,
+                subgroup_size=subgroup_size,
+            )
+    elif batched:
         def once():
             for start_index in range(0, count, chunk):
                 newton_schulz_tp_batched(
@@ -446,6 +615,16 @@ def main() -> None:
              "When set, 'fastest step' is reported over the set-composed policies.",
     )
     parser.add_argument(
+        "--subgroup-sizes",
+        nargs="*",
+        type=int,
+        default=[],
+        help="Under --set-timing, also time subgroup duplication at these duplication-"
+             "group sizes g (each must divide the world size and be < it). The owned "
+             "same-shape set is dealt round-robin over world/g subgroups; see "
+             "newton_schulz_tp_subgroup. Empty (the default) leaves it off entirely.",
+    )
+    parser.add_argument(
         "--batch-chunk",
         type=int,
         default=64,
@@ -493,6 +672,19 @@ def main() -> None:
         f"{group_size} ranks; got {world}."
     )
 
+    # Validated here, before any timing runs: a bad g is a typo in the sbatch, and finding
+    # out about it after the per-shape sweep wastes the job.
+    subgroup_sizes = sorted({g for g in config.subgroup_sizes if g > 0}) if config.set_timing else []
+    for g in subgroup_sizes:
+        assert group_size % g == 0 and g < group_size, (
+            f"--subgroup-sizes {g} must divide the {group_size}-rank group and be smaller "
+            f"than it (g == group size is plain 'duplicated')."
+        )
+    if subgroup_sizes:
+        assert "duplicated" in config.modes, (
+            "subgroup duplication is a 'duplicated' variant; keep duplicated in --modes."
+        )
+
     # Collapse the dp_size ranks into distinct ownership profiles.
     profiles: Dict[Tuple, List[int]] = {}
     for dp_rank in range(dp_size):
@@ -518,6 +710,13 @@ def main() -> None:
             f"set_timing=True: owned same-shape groups are also timed as a SET "
             f"(batch_chunk={config.batch_chunk}). 'fastest step' is over the set-composed "
             f"policies only."
+        )
+    if subgroup_sizes:
+        log(
+            f"subgroup_sizes={subgroup_sizes}: subgroup duplication is timed at "
+            f"these g and enters the scored policy '{PER_SHAPE_SUBGROUP_POLICY}', which "
+            f"substitutes it ONLY on shapes whose unscoped set-composed winner is already "
+            f"'duplicated{SET_SUFFIX}'."
         )
     log("")
 
@@ -614,6 +813,7 @@ def main() -> None:
     group_ms: Dict[Tuple, Dict[str, float]] = {}
     set_policies: List[str] = []
     best_set_mode_for_shape: Dict[Tuple, str] = {}
+    best_subgroup_for_shape: Dict[Tuple, str] = {}
     if config.set_timing:
         # Every (shape, owned count) pair that appears in any rank profile, timed once.
         needed: Dict[Tuple, set] = {}
@@ -646,6 +846,19 @@ def main() -> None:
                         config.coefficient_type, config.iters, config.warmup, shard_count,
                         config.use_syrk, batched=True, batch_chunk=config.batch_chunk,
                     )
+                # Subgroup duplication, one column per g. Timed on every shape so the
+                # column is readable, but SCORED only where noted below.
+                for g in subgroup_sizes:
+                    if shard_count == 1:
+                        # Replicated weight: no shards to redistribute, so subgrouping is
+                        # a no-op that would only re-time ``duplicated``. Skipped, not
+                        # timed, so no column implies a win that is not there.
+                        continue
+                    entry[subgroup_policy(g)] = time_group(
+                        stack, group, "duplicated", config.num_ns_steps,
+                        config.coefficient_type, config.iters, config.warmup, shard_count,
+                        config.use_syrk, subgroup_size=g,
+                    )
                 group_ms[(matrix, count)] = entry
                 for policy, ms in entry.items():
                     log(
@@ -668,6 +881,33 @@ def main() -> None:
                     set_modes, key=lambda m: group_ms[(matrix, biggest)][m]
                 )
             set_policies.append(per_shape_set_policy)
+        # ------------------------------------------------------------------------------
+        # Scored subgroup policy.
+        #
+        # The per-g columns are NOT scored on their own: applied blindly to every shape
+        # they would also replace ``distributed`` on the shapes where ``distributed``
+        # wins, which is a different question (a different duplication-group knob on a
+        # different mode) and would be scored here without being asked. This policy is
+        # exactly ``per_shape_set`` with subgroup duplication substituted on the shapes
+        # whose unscoped set-composed winner is ALREADY ``duplicated_set`` -- so the only
+        # thing it changes relative to its own reference arm is the size of a duplication
+        # group that the reference already chose to use.
+        # ------------------------------------------------------------------------------
+        if subgroup_sizes and best_set_mode_for_shape:
+            duplicated_set = f"duplicated{SET_SUFFIX}"
+            for matrix in distinct:
+                base = best_set_mode_for_shape[matrix]
+                biggest = sorted(needed.get(matrix, ()))[-1]
+                entry = group_ms[(matrix, biggest)]
+                arms = [g for g in subgroup_sizes if subgroup_policy(g) in entry]
+                if base != duplicated_set or not arms:
+                    best_subgroup_for_shape[matrix] = base
+                    continue
+                best_g = min(arms, key=lambda g: entry[subgroup_policy(g)])
+                best_subgroup_for_shape[matrix] = min(
+                    (base, subgroup_policy(best_g)), key=lambda p: entry[p]
+                )
+            set_policies.append(PER_SHAPE_SUBGROUP_POLICY)
         policies += set_policies
 
     def resolve(matrix, policy: str) -> str:
@@ -676,12 +916,15 @@ def main() -> None:
             return best_mode_for_shape[matrix]
         if policy == per_shape_set_policy:
             return best_set_mode_for_shape[matrix]
+        if policy == PER_SHAPE_SUBGROUP_POLICY:
+            return best_subgroup_for_shape[matrix]
         return policy
 
     def policy_mode(policy: str) -> str:
         """The underlying tp_mode a policy runs, for the FLOP model."""
-        mode = policy[: -len(SET_SUFFIX)] if policy.endswith(SET_SUFFIX) else policy
-        return "duplicated" if policy == BATCH_POLICY else mode
+        if policy == BATCH_POLICY or policy.startswith(SUBGROUP_PREFIX):
+            return "duplicated"
+        return policy[: -len(SET_SUFFIX)] if policy.endswith(SET_SUFFIX) else policy
 
     def group_total(signature, policy: str) -> float:
         """Profile total for one policy: the composition is 'sum over owned groups'."""
@@ -755,19 +998,46 @@ def main() -> None:
     # same tensors, under the same composition.
     if config.set_timing:
         candidates = set_policies
-        baseline_pool = [p for p in set_policies if p != BATCH_POLICY]
+        # The reference arm must contain no candidate mechanism: neither the batched arm
+        # nor any subgroup arm. What is left is the unmodified algorithm under the same
+        # composition, which is what a candidate delta is subtracted from.
+        baseline_pool = [
+            p for p in set_policies
+            if p != BATCH_POLICY and p != PER_SHAPE_SUBGROUP_POLICY
+            and not p.startswith(SUBGROUP_PREFIX)
+        ]
         baseline = min(baseline_pool, key=lambda p: max(totals[p]))
         log(
             f"\nset-composed baseline (unbatched): {baseline} "
             f"({max(totals[baseline]):.3f} ms)"
         )
+        if PER_SHAPE_SUBGROUP_POLICY in set_policies:
+            # Printed explicitly so the scored pair is one grep away and can never be
+            # formed from arms measured in different jobs or under different compositions.
+            log(
+                f"subgroup candidate arm: {PER_SHAPE_SUBGROUP_POLICY} "
+                f"({max(totals[PER_SHAPE_SUBGROUP_POLICY]):.3f} ms), "
+                f"delta vs {baseline} = "
+                f"{max(totals[PER_SHAPE_SUBGROUP_POLICY]) - max(totals[baseline]):+.3f} ms"
+            )
+            log(
+                "  subgroup selection: "
+                + ", ".join(
+                    f"{e[0][0] * e[1]}x{e[0][1]}={best_subgroup_for_shape[e]}"
+                    for e in distinct
+                )
+            )
     else:
         candidates = policies
 
     best = min(candidates, key=lambda p: max(totals[p]))
     log(f"\nfastest step: {best} ({max(totals[best]):.3f} ms)")
-    if best in (per_shape_policy, per_shape_set_policy):
-        selection = best_mode_for_shape if best == per_shape_policy else best_set_mode_for_shape
+    if best in (per_shape_policy, per_shape_set_policy, PER_SHAPE_SUBGROUP_POLICY):
+        selection = {
+            per_shape_policy: best_mode_for_shape,
+            per_shape_set_policy: best_set_mode_for_shape,
+            PER_SHAPE_SUBGROUP_POLICY: best_subgroup_for_shape,
+        }[best]
         log(
             f"  {best} selection: "
             + ", ".join(f"{e[0][0] * e[1]}x{e[0][1]}={selection[e]}" for e in distinct)
