@@ -937,9 +937,13 @@ BALANCED_SUFFIX = "_bal"
 PER_SHAPE_FUSED_EXCHANGE_POLICY = "per_shape_fuse_sub_set"
 
 
-def fused_exchange_policy(subgroup_size: int, balanced: bool = False) -> str:
+def fused_exchange_policy(
+    subgroup_size: int, balanced: bool = False, pipe_chunks: int = 0
+) -> str:
     return (
-        f"{FUSED_EXCHANGE_PREFIX}{subgroup_size}" + (BALANCED_SUFFIX if balanced else "")
+        f"{FUSED_EXCHANGE_PREFIX}{subgroup_size}"
+        + (BALANCED_SUFFIX if balanced else "")
+        + (f"{PIPE_SUFFIX}{pipe_chunks}" if pipe_chunks else "")
     )
 
 
@@ -968,6 +972,269 @@ def fused_subgroup_deal(full_shapes, counts, groups: int, balanced: bool):
     return owners
 
 
+# --------------------------------------------------------------------------------------
+# Pipelined, staging-lean variant of the CROSS-SHAPE fused subgroup exchange
+# (--pipeline-fused-exchange). This is the port of the accepted EGTP restructure
+# (``_subgroup_pipelined``, stage-3 phase 3) onto ``newton_schulz_tp_subgroup_fused``,
+# which is the last hot region still running the pre-stage-3 shape: ONE
+# ``all_to_all_single`` in, every matrix computed, ONE ``all_to_all_single`` out, with a
+# python ``cat``/``stack`` staging loop on each side and a PER-MATRIX ``newton_schulz``
+# loop in between.
+#
+# Three mechanisms, one diff -- all three already measured on the EGTP axis:
+#
+#   1. ASYNC CHUNKED EXCHANGE. The subgroup's pooled share is split into ``pipe_chunks``
+#      windows of its flat (shape-major) item list and each window gets its own pair of
+#      exchanges, issued ``async_op=True``. Chunk c+1's input exchange goes on the wire
+#      before chunk c's compute is issued and every output exchange is left in flight, so
+#      the wire overlaps a different chunk's Newton-Schulz instead of bracketing all of it.
+#      The window boundaries are pure arithmetic over ``owned``, which every rank computes
+#      identically, so the two collectives stay in lockstep.
+#
+#   2. STAGING-LOOP ELISION. The monolithic send buffer is built per DESTINATION RANK, but
+#      what a destination needs depends only on its SUBGROUP -- so at ``subgroup_size = g``
+#      the buffer holds every byte ``g`` times, materialised by a
+#      ``groups * n_shapes * g``-iteration python gather loop feeding one giant
+#      ``torch.cat``. The LIST form of ``all_to_all`` takes one tensor per peer, so the
+#      per-subgroup block is staged ONCE and handed to all ``g`` of its ranks: the send
+#      buffer shrinks by ``g`` (4x on the GTP axis) and the ``cat`` disappears, replaced by
+#      ``index_select(..., out=)`` writing straight into its final slot. On the way out the
+#      ``groups * n_shapes`` ``torch.stack`` python loop plus ``cat`` collapses to ONE
+#      strided ``copy_`` per shape per chunk, because the destinations this rank serves are
+#      the arithmetic progression ``my_slot :: subgroup_size`` -- a pure view of the result.
+#      The block-ownership VIEW trick of ``_subgroup_pipelined`` is NOT reused: it is only
+#      legal at ``g == 1``, where a block has exactly one destination. Here the same block
+#      goes to ``g`` destinations, so what is elided is the REPLICATION, not the copy.
+#
+#   3. BATCHED + FUSED NEWTON-SCHULZ. The monolithic path runs ``newton_schulz`` once per
+#      owned matrix; here every matrix of one shape inside a chunk is one batched call into
+#      ``kernels.fused_ns.fused_newton_schulz_batched``, which fuses the fp32
+#      normalize/cast prologue and the bf16->fp32 cast-and-store epilogue around the
+#      IDENTICAL 5-step chain. The gather buffer stays fp32 and contiguous so
+#      ``fused_ns._supported`` holds and the fusion cannot silently un-bank; if it does not
+#      hold, that entry point falls back to the very same library ``newton_schulz``.
+#
+# The arithmetic is untouched. Every matrix is still all-gathered in RANK order, still
+# orthogonalized WHOLE, same 5 steps, same polar_express coefficients, same SYRK path, same
+# deal (``fused_subgroup_deal`` is called once, before the branch), and each shape still
+# returns this rank's slice of every matrix in INPUT order. Only how the two collectives
+# are staged, scheduled and chunked changes.
+#
+# Collective count per region goes from 2 to ``2 * pipe_chunks``, and the scatter into
+# ``results`` goes from ``groups * n_shapes`` writes to ``pipe_chunks`` times that, which
+# is why the chunk count is small and is swept as its own arm rather than assumed.
+# --------------------------------------------------------------------------------------
+
+
+def _fused_exchange_pipelined(
+    stacks: List[torch.Tensor],
+    steps: int,
+    coefficient_type: str,
+    tp_group,
+    use_syrk: bool,
+    subgroup_size: int,
+    groups: int,
+    my_sub: int,
+    my_slot: int,
+    owned,
+    counts,
+    dims,
+    elems,
+    dtype,
+    device,
+    pipe_chunks: int,
+) -> List[torch.Tensor]:
+    """``newton_schulz_tp_subgroup_fused`` with the exchange chunked, async and unstaged.
+
+    Every argument after ``use_syrk`` is the setup the caller already computed, passed in
+    rather than recomputed so the DEAL is provably the same object both arms run.
+    """
+    world = tp_group.size()
+    n_shapes = len(stacks)
+
+    # ---- windows: contiguous slices of each subgroup's flat, SHAPE-MAJOR item list ------
+    # Shape-major is not a choice: it is the order the monolithic path's send buffer and
+    # receive parse already use, so a window of it maps to a contiguous slice of
+    # ``owned[i][s]`` for every shape at once.
+    item_counts = [sum(len(owned[i][s]) for i in range(n_shapes)) for s in range(groups)]
+    n_chunks = max(1, min(int(pipe_chunks), max(item_counts) if item_counts else 1))
+
+    # slices[s][c][i] = (lo, hi) into owned[i][s] -- identical on every rank.
+    slices = []
+    for s in range(groups):
+        cnt = item_counts[s]
+        size = (cnt + n_chunks - 1) // n_chunks if cnt else 0
+        wins = [(a, min(a + size, cnt)) for a in range(0, cnt, size)] if size else []
+        wins += [(cnt, cnt)] * (n_chunks - len(wins))
+        per_chunk = []
+        for p, q in wins:
+            base, cuts = 0, []
+            for i in range(n_shapes):
+                n_i = len(owned[i][s])
+                cuts.append((min(max(p - base, 0), n_i), min(max(q - base, 0), n_i)))
+                base += n_i
+            per_chunk.append(cuts)
+        slices.append(per_chunk)
+
+    def blk(s: int, c: int) -> int:
+        """Elements subgroup ``s``'s window ``c`` occupies per rank, across all shapes."""
+        return sum((hi - lo) * elems[i] for i, (lo, hi) in enumerate(slices[s][c]))
+
+    # ---- one device index tensor per shape, holding owned[i][0] ++ owned[i][1] ++ ... ---
+    # Every per-(subgroup, chunk) index list is then a VIEW of it, so the gather and the
+    # scatter cost 2 * n_shapes host-to-device copies per region, not 2 * groups *
+    # n_shapes * n_chunks.
+    perm, runbase = [], []
+    for i in range(n_shapes):
+        flat, bases, base = [], [], 0
+        for s in range(groups):
+            bases.append(base)
+            flat.extend(owned[i][s])
+            base += len(owned[i][s])
+        perm.append(torch.tensor(flat, dtype=torch.long, device=device))
+        runbase.append(bases)
+
+    results = [
+        torch.empty((counts[i], dims[i][0], dims[i][1]), dtype=dtype, device=device)
+        for i in range(n_shapes)
+    ]
+    empty = torch.empty(0, dtype=dtype, device=device)
+
+    def issue_input(c: int):
+        """Stage window ``c`` ONCE per destination SUBGROUP and put it on the wire."""
+        sizes = [blk(s, c) for s in range(groups)]
+        offs, total = [], 0
+        for s in range(groups):
+            offs.append(total)
+            total += sizes[s]
+        stage = torch.empty(total, dtype=dtype, device=device)
+        cursor = 0
+        for s in range(groups):
+            for i in range(n_shapes):
+                lo, hi = slices[s][c][i]
+                n = hi - lo
+                if n == 0:
+                    continue
+                rows, cols = dims[i]
+                span = n * elems[i]
+                torch.index_select(
+                    stacks[i], 0,
+                    perm[i][runbase[i][s] + lo : runbase[i][s] + hi],
+                    out=stage[cursor : cursor + span].view(n, rows, cols),
+                )
+                cursor += span
+        recv_n = blk(my_sub, c)
+        recv = torch.empty(world * recv_n, dtype=dtype, device=device)
+        recv_v = recv.view(world, recv_n)
+        # Destination d needs its SUBGROUP's block; the g ranks of a subgroup are handed
+        # the SAME staged tensor rather than g copies of it.
+        work = torch.distributed.all_to_all(
+            [recv_v[src] for src in range(world)],
+            [stage[offs[d // subgroup_size] : offs[d // subgroup_size] + sizes[d // subgroup_size]]
+             for d in range(world)],
+            group=tp_group,
+            async_op=True,
+        )
+        return work, recv, recv_n, stage
+
+    def compute_and_send(c: int, recv: torch.Tensor, recv_n: int):
+        recv_v = recv.view(world, recv_n)
+        ys, offset = [], 0
+        for i in range(n_shapes):
+            lo, hi = slices[my_sub][c][i]
+            n = hi - lo
+            if n == 0:
+                continue
+            rows, cols = dims[i]
+            span = n * elems[i]
+            # (src, matrix, rows, cols) -> (matrix, src * rows, cols): per matrix the
+            # shards concatenated in RANK order, which is what duplicated's all_gather +
+            # cat(dim=partition_dim) produces. ``unflatten`` keeps it a view, so this is
+            # ONE strided copy, the same one the monolithic ``permute -> reshape`` pays.
+            src = recv_v[:, offset : offset + span].unflatten(1, (n, rows, cols))
+            offset += span
+            gx = torch.empty((n, world * rows, cols), dtype=dtype, device=device)
+            gx.view(n, world, rows, cols).copy_(src.permute(1, 0, 2, 3))
+            y = fused_newton_schulz_batched(
+                gx, steps, coefficient_type, use_syrk=use_syrk,
+                out=torch.empty_like(gx),
+            )
+            del gx
+            ys.append((i, n, y))
+
+        sendout = torch.empty(groups * recv_n, dtype=dtype, device=device)
+        send_v = sendout.view(groups, recv_n)
+        offset = 0
+        for i, n, y in ys:
+            rows, cols = dims[i]
+            span = n * elems[i]
+            # This rank serves destinations my_slot, my_slot + g, my_slot + 2g, ... -- an
+            # arithmetic progression, so row block selection is a pure VIEW and the whole
+            # per-destination ``stack``/``cat`` python loop is one strided copy.
+            send_v[:, offset : offset + span].unflatten(1, (n, rows, cols)).copy_(
+                y.view(n, world, rows, cols)[:, my_slot::subgroup_size].permute(1, 0, 2, 3)
+            )
+            offset += span
+        del ys
+
+        sizes = [blk(s, c) for s in range(groups)]
+        offs, total = [], 0
+        for s in range(groups):
+            offs.append(total)
+            total += sizes[s]
+        outbuf = torch.empty(total, dtype=dtype, device=device)
+        out_list, in_list = [], []
+        for r in range(world):
+            if r % subgroup_size == my_slot:
+                s = r // subgroup_size
+                out_list.append(outbuf[offs[s] : offs[s] + sizes[s]])
+                in_list.append(send_v[s])
+            else:
+                out_list.append(empty)
+                in_list.append(empty)
+        work = torch.distributed.all_to_all(
+            out_list, in_list, group=tp_group, async_op=True
+        )
+        return work, outbuf, offs, sendout
+
+    pending_in = [None] * n_chunks
+    pending_in[0] = issue_input(0)
+    pending_out = []
+    for c in range(n_chunks):
+        # Prefetch: window c+1's input exchange is on the wire BEFORE window c's compute
+        # is issued, so it overlaps it. Every rank issues the same sequence.
+        if c + 1 < n_chunks:
+            pending_in[c + 1] = issue_input(c + 1)
+        work, recv, recv_n, stage = pending_in[c]
+        pending_in[c] = None
+        work.wait()
+        del stage
+        pending_out.append(compute_and_send(c, recv, recv_n))
+        del recv, work
+
+    for work, _outbuf, _offs, _sendout in pending_out:
+        work.wait()
+    # Scatter last: subgroup-major then shape-major, exactly the cursor walk the monolithic
+    # path does, so ``results[i]`` is filled in INPUT order either way.
+    for c, (_work, outbuf, offs, _sendout) in enumerate(pending_out):
+        for s in range(groups):
+            cursor = offs[s]
+            for i in range(n_shapes):
+                lo, hi = slices[s][c][i]
+                n = hi - lo
+                if n == 0:
+                    continue
+                rows, cols = dims[i]
+                span = n * elems[i]
+                results[i].index_copy_(
+                    0,
+                    perm[i][runbase[i][s] + lo : runbase[i][s] + hi],
+                    outbuf[cursor : cursor + span].view(n, rows, cols),
+                )
+                cursor += span
+    return results
+
+
 def newton_schulz_tp_subgroup_fused(
     stacks: List[torch.Tensor],
     steps: int,
@@ -976,6 +1243,8 @@ def newton_schulz_tp_subgroup_fused(
     use_syrk: bool = False,
     subgroup_size: int = 0,
     balanced: bool = False,
+    pipelined: bool = False,
+    pipe_chunks: int = 0,
 ) -> List[torch.Tensor]:
     """Subgroup duplication over SEVERAL shapes at once, with one pair of exchanges.
 
@@ -1029,6 +1298,25 @@ def newton_schulz_tp_subgroup_fused(
         return sum(len(owned[i][sub]) * elems[i] for i in range(n_shapes))
 
     my_block = sub_elems(my_sub)
+
+    if pipelined:
+        # Same deal (``owners`` above), same math, restructured exchange -- see
+        # ``_fused_exchange_pipelined``. A silent fallback here would let the arm be scored
+        # while running the code it claims to replace, so the precondition is a hard error.
+        if pipe_chunks <= 0:
+            raise ValueError(
+                f"pipelined fused exchange needs pipe_chunks >= 1, got {pipe_chunks}"
+            )
+        if not HAVE_FUSED_NS:
+            raise ValueError(
+                "pipelined fused exchange requires kernels.fused_ns; it batches the "
+                "per-matrix Newton-Schulz loop through the fused entry point"
+            )
+        return _fused_exchange_pipelined(
+            stacks, steps, coefficient_type, tp_group, use_syrk,
+            subgroup_size, groups, my_sub, my_slot, owned, counts, dims, elems,
+            dtype, device, pipe_chunks,
+        )
 
     # ---- ONE input exchange over every shape ------------------------------------------
     # Peer-major outer, shape-major inner: destination d gets, for each shape in order,
@@ -1132,7 +1420,7 @@ def newton_schulz_tp_subgroup_fused(
 
 def time_fused_group(
     stacks, group, steps, coefficient_type, iters, warmup, use_syrk=False,
-    subgroup_size=0, balanced=False,
+    subgroup_size=0, balanced=False, pipelined=False, pipe_chunks=0,
 ) -> float:
     """Median wall-clock ms for ONE fused region spanning several owned shape groups.
 
@@ -1150,6 +1438,8 @@ def time_fused_group(
             use_syrk=use_syrk,
             subgroup_size=subgroup_size,
             balanced=balanced,
+            pipelined=pipelined,
+            pipe_chunks=pipe_chunks,
         )
 
     for _ in range(warmup):
@@ -1384,6 +1674,32 @@ def main() -> None:
              "so without it the scored policy set is byte-identical to before.",
     )
     parser.add_argument(
+        "--pipeline-fused-exchange",
+        action="store_true",
+        help="Under --fuse-shape-exchanges, ALSO time each fused-exchange arm with the "
+             f"restructured exchange ('{FUSED_EXCHANGE_PREFIX}<g>[{BALANCED_SUFFIX}]"
+             f"{PIPE_SUFFIX}<N>') and let the fused-arm argmin see it. Same deal, same "
+             "matrices, same 5 steps / polar_express coefficients / SYRK path -- what "
+             "changes is that the pooled share is split into N windows whose exchanges are "
+             "issued async so the wire overlaps a different window's compute, that the "
+             "per-destination send staging is replaced by one per-SUBGROUP block handed to "
+             "the list form of all_to_all (the buffer shrinks by g and the cat/stack python "
+             "loops collapse to one strided copy), and that the per-matrix newton_schulz "
+             "loop becomes one batched call into the fused kernel. Off by default, so "
+             "without it the scored policy set is byte-identical to before.",
+    )
+    parser.add_argument(
+        "--fused-pipe-chunks",
+        type=int,
+        nargs="+",
+        default=[2, 4],
+        help="Pipeline depths N to time under --pipeline-fused-exchange, each its own arm. "
+             "The GTP fused region's pooled share is only 3-4 matrices per subgroup, so N "
+             "is bounded by that; N = 1 degenerates to no overlap. Each N raises the "
+             "collective count per region to 2*N and the results scatter to N times "
+             "groups*shapes writes, so the sweep is what prices the tradeoff.",
+    )
+    parser.add_argument(
         "--batch-replicated-shapes",
         action="store_true",
         help="Additionally score '" + PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY + "': "
@@ -1448,6 +1764,19 @@ def main() -> None:
         assert group_size % g == 0 and g < group_size, (
             f"--subgroup-sizes {g} must divide the {group_size}-rank group and be smaller "
             f"than it (g == group size is plain 'duplicated')."
+        )
+    if config.pipeline_fused_exchange:
+        assert config.fuse_shape_exchanges, (
+            "--pipeline-fused-exchange requires --fuse-shape-exchanges: it restructures "
+            "the fused cross-shape exchange, so there is nothing to restructure without it."
+        )
+        assert all(n >= 1 for n in config.fused_pipe_chunks), (
+            f"--fused-pipe-chunks must all be >= 1, got {config.fused_pipe_chunks}"
+        )
+        assert HAVE_FUSED_NS, (
+            "--pipeline-fused-exchange needs kernels.fused_ns (FUSED_NS_DIR); the arm "
+            "batches the per-matrix Newton-Schulz loop through the fused entry point and "
+            "must never silently score the unfused code it claims to replace."
         )
     if config.subgroup_batched:
         assert config.set_timing and subgroup_sizes, (
@@ -2107,7 +2436,7 @@ def main() -> None:
                     "ns_cost.)"
                 )
                 fused_header = (
-                    f"  {'profile':>8}{'shapes':>8}{'matrices':>10}{'arm':>16}"
+                    f"  {'profile':>8}{'shapes':>8}{'matrices':>10}{'arm':>22}"
                     f"{'fused ms':>11}{'per-shape sum ms':>18}{'delta ms':>11}"
                 )
                 log(fused_header)
@@ -2129,19 +2458,28 @@ def main() -> None:
                     entry: Dict[str, float] = {}
                     for g in subgroup_sizes:
                         for balanced in (False, True):
-                            arm = fused_exchange_policy(g, balanced)
-                            entry[arm] = time_fused_group(
-                                stacks, group, config.num_ns_steps,
-                                config.coefficient_type, config.iters, config.warmup,
-                                config.use_syrk, subgroup_size=g, balanced=balanced,
+                            # (pipe_chunks = 0) is the monolithic arm; the rest are the
+                            # restructured ones, timed in the SAME job over the SAME
+                            # tensors under the SAME composition.
+                            depths = [0] + (
+                                list(config.fused_pipe_chunks)
+                                if config.pipeline_fused_exchange else []
                             )
-                            log(
-                                f"  {p_index:>8}{len(fused):>8}"
-                                f"{sum(n for _, n in fused):>10}{arm:>16}"
-                                f"{entry[arm]:>11.3f}{reference_sum:>18.3f}"
-                                f"{entry[arm] - reference_sum:>+11.3f}"
-                            )
-                            torch.cuda.empty_cache()
+                            for pc in depths:
+                                arm = fused_exchange_policy(g, balanced, pc)
+                                entry[arm] = time_fused_group(
+                                    stacks, group, config.num_ns_steps,
+                                    config.coefficient_type, config.iters, config.warmup,
+                                    config.use_syrk, subgroup_size=g, balanced=balanced,
+                                    pipelined=bool(pc), pipe_chunks=pc,
+                                )
+                                log(
+                                    f"  {p_index:>8}{len(fused):>8}"
+                                    f"{sum(n for _, n in fused):>10}{arm:>22}"
+                                    f"{entry[arm]:>11.3f}{reference_sum:>18.3f}"
+                                    f"{entry[arm] - reference_sum:>+11.3f}"
+                                )
+                                torch.cuda.empty_cache()
                     fused_region_ms[signature] = entry
                     del stacks
                     torch.cuda.empty_cache()

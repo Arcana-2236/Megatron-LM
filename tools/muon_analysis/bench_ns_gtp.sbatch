@@ -106,6 +106,20 @@ SUBGROUP_SIZES=${SUBGROUP_SIZES:-"4 8 16"}
 # 'duplicated_batch') are untouched and asserted so. Because which shapes a fused region
 # spans is a property of the RANK PROFILE, the fused rows are reported per profile and
 # never re-attributed to one shape.
+# --pipeline-fused-exchange: adds the stage-4 phase-2 candidate `gtp-exchange-pipeline` as
+# EXTRA COLUMNS of the fused-exchange region, one per pipeline depth in
+# --fused-pipe-chunks, timed in the SAME job over the SAME tensors under the SAME
+# composition as the monolithic arms and fed to the SAME fused-arm argmin. It is the port
+# of the accepted EGTP restructure onto `newton_schulz_tp_subgroup_fused`, the last hot
+# region still running the pre-stage-3 shape: async chunked exchange (the wire overlaps a
+# different window's compute instead of bracketing all of it), staging-loop elision (the
+# per-destination send buffer -- which at g = 4 holds every byte FOUR times -- becomes one
+# per-SUBGROUP block handed to the list form of all_to_all, and the cat/stack python loops
+# collapse to one strided copy per shape per chunk), and one batched call into
+# kernels.fused_ns per shape per chunk in place of the per-matrix newton_schulz loop.
+# Identical math: same deal, same matrices, same 5 steps, same polar_express coefficients,
+# same SYRK path, and each shape still returns this rank's slice of every matrix in INPUT
+# order. Off by default in the benchmark, so the flag is what turns it on here.
 options=" \
     --group gtp \
     --modelled-world-size 128 \
@@ -120,6 +134,8 @@ options=" \
     --subgroup-all-shapes \
     --batch-replicated-shapes \
     --fuse-shape-exchanges \
+    --pipeline-fused-exchange \
+    --fused-pipe-chunks ${FUSED_PIPE_CHUNKS:-2 4} \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
