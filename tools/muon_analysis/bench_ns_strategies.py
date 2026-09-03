@@ -461,6 +461,18 @@ PIPE_SUFFIX = "_pipe"
 # PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY when --fused-ns-kernel is on, else
 # PER_SHAPE_BATCH_SUBGROUP_POLICY.
 PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY = "per_shape_batch_sub_pipe_set"
+# The self-block-elision candidate (--elide-self-block). Same subgroup deal, same batched
+# Newton-Schulz, same coefficients, same block ownership, same pipeline depth -- the ONLY
+# difference is that the ``s == rank`` entry of each per-chunk exchange is dropped from the
+# collective and served by a local device write into the buffer that consumes it. Timed as
+# its own column beside the pipelined arm it substitutes, from the SAME job over the SAME
+# tensors under the SAME composition. Suffix goes AFTER PIPE_SUFFIX so an elided fused
+# pipelined arm reads ``duplicated_batch_sub_g1_fused_pipe_selfelide``; policy_mode strips
+# all three.
+ELIDE_SUFFIX = "_selfelide"
+# The scored pair: reference is PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY, the state stage-3
+# phase 3 banked.
+PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY = "per_shape_batch_sub_elide_set"
 
 
 def subgroup_policy(subgroup_size: int) -> str:
@@ -468,12 +480,14 @@ def subgroup_policy(subgroup_size: int) -> str:
 
 
 def batch_subgroup_policy(
-    subgroup_size: int, fused: bool = False, pipelined: bool = False
+    subgroup_size: int, fused: bool = False, pipelined: bool = False,
+    elide_self: bool = False,
 ) -> str:
     return (
         f"{BATCH_SUBGROUP_PREFIX}{subgroup_size}"
         + (FUSED_SUFFIX if fused else "")
         + (PIPE_SUFFIX if pipelined else "")
+        + (ELIDE_SUFFIX if elide_self else "")
     )
 
 
@@ -532,6 +546,7 @@ def _subgroup_pipelined(
     use_syrk: bool,
     fused: bool,
     pipe_chunks: int,
+    elide_self: bool = False,
 ) -> torch.Tensor:
     """``newton_schulz_tp_subgroup`` at ``subgroup_size == 1``, pipelined and staging-free.
 
@@ -564,17 +579,51 @@ def _subgroup_pipelined(
         if fused else None
     )
 
+    # ``elide_self``: the s == rank entry of both exchanges is this rank's OWN block --
+    # ``stack[rank*mine+a : rank*mine+b]`` on the way in, row block ``rank`` of the result
+    # on the way out. It is already in this device's HBM, so handing it to the collective
+    # only asks NCCL to move it back to where it is. Under
+    # ``NCCL_P2P_DISABLE=1``/``NCCL_SHM_DISABLE=1``/``NCCL_NVLS_ENABLE=0`` -- the settings
+    # that make the 2-rank proxy take the network path -- whether that self connection is
+    # still serviced locally is exactly the question ``probe_selfblock_transport.sbatch``
+    # answers. With the flag on it cannot be on the wire either way: the collective becomes
+    # a peer-only ``batch_isend_irecv`` over the (world - 1) real peers, and the own block
+    # is written straight into the buffer that consumes it -- into ``gx`` on the way in and
+    # into ``result`` on the way out, so NOT ONE extra byte of HBM traffic is added
+    # relative to the transposes the monolithic path already pays.
+    #
+    # Peers are addressed by GLOBAL rank via ``get_global_rank(tp_group, s)``, which is what
+    # ``P2POp`` takes; at ``egtp = 2`` this is one isend + one irecv per chunk per leg.
+    # Arithmetic, ordering and the returned tensor are unchanged: the same row block from
+    # the same source lands in the same slot, so the result must be BIT-IDENTICAL.
+    peers = [s for s in range(world) if s != rank] if elide_self else list(range(world))
+    global_peer = (
+        {s: torch.distributed.get_global_rank(tp_group, s) for s in peers}
+        if elide_self else {}
+    )
+
     def issue_input(ci):
         a, b = windows[ci]
         # Send peer d the block of matrices d owns, window [a, b): a contiguous view of
         # ``stack`` -- no packing copy. Receive from peer s that peer's shard of MY
         # matrices, window [a, b), landing peer-major in ``recv``.
-        return torch.distributed.all_to_all(
+        if elide_self:
+            if not peers:
+                return []
+            ops = []
+            for s in peers:
+                ops.append(torch.distributed.P2POp(
+                    torch.distributed.irecv, recv[s, a:b], global_peer[s], tp_group))
+                ops.append(torch.distributed.P2POp(
+                    torch.distributed.isend,
+                    stack[s * mine + a : s * mine + b], global_peer[s], tp_group))
+            return torch.distributed.batch_isend_irecv(ops)
+        return [torch.distributed.all_to_all(
             [recv[s, a:b] for s in range(world)],
             [stack[d * mine + a : d * mine + b] for d in range(world)],
             group=tp_group,
             async_op=True,
-        )
+        )]
 
     in_works = [None] * len(windows)
     in_works[0] = issue_input(0)
@@ -585,13 +634,24 @@ def _subgroup_pipelined(
         # compute is issued, so it overlaps it. Every rank issues the same sequence.
         if ci + 1 < len(windows):
             in_works[ci + 1] = issue_input(ci + 1)
-        in_works[ci].wait()
+        for work in in_works[ci]:
+            work.wait()
         in_works[ci] = None
         n = b - a
         # (peer, matrix, rows, cols) -> (matrix, peer * rows, cols): per matrix the shards
         # concatenated in RANK order, identical to duplicated's all_gather + cat(dim=0).
         gx_c = gx[:n]
-        gx_c.view(n, world, rows, cols).copy_(recv[:, a:b].transpose(0, 1))
+        if elide_self:
+            # Same transpose, one peer slice at a time, with the self slice taken from
+            # ``stack`` instead of from ``recv``. Same bytes copied, same RANK order.
+            gx_v = gx_c.view(n, world, rows, cols)
+            for s in range(world):
+                if s == rank:
+                    gx_v[:, s].copy_(stack[rank * mine + a : rank * mine + b])
+                else:
+                    gx_v[:, s].copy_(recv[s, a:b])
+        else:
+            gx_c.view(n, world, rows, cols).copy_(recv[:, a:b].transpose(0, 1))
 
         if fused:
             fused_newton_schulz_batched(
@@ -602,18 +662,39 @@ def _subgroup_pipelined(
             y = newton_schulz(gx_c, steps, coefficient_type, use_syrk=use_syrk)
 
         # Inverse transpose: row block d of every result goes to peer d, peer-major.
-        sendout[:, a:b].copy_(y.view(n, world, rows, cols).transpose(0, 1))
+        if elide_self:
+            # Row block ``rank`` is this rank's own answer for its own matrices: write it
+            # straight into ``result`` rather than staging it for a self-send.
+            y_v = y.view(n, world, rows, cols)
+            for d in range(world):
+                if d == rank:
+                    result[rank * mine + a : rank * mine + b].copy_(y_v[:, d])
+                else:
+                    sendout[d, a:b].copy_(y_v[:, d])
+        else:
+            sendout[:, a:b].copy_(y.view(n, world, rows, cols).transpose(0, 1))
         del y
         # Peer s owns matrices [s * mine, (s + 1) * mine); its reply for window [a, b)
         # lands DIRECTLY in the output slice -- no scatter copy.
-        out_works.append(
-            torch.distributed.all_to_all(
-                [result[s * mine + a : s * mine + b] for s in range(world)],
-                [sendout[d, a:b] for d in range(world)],
-                group=tp_group,
-                async_op=True,
+        if elide_self:
+            ops = []
+            for s in peers:
+                ops.append(torch.distributed.P2POp(
+                    torch.distributed.irecv,
+                    result[s * mine + a : s * mine + b], global_peer[s], tp_group))
+                ops.append(torch.distributed.P2POp(
+                    torch.distributed.isend, sendout[s, a:b], global_peer[s], tp_group))
+            if ops:
+                out_works.extend(torch.distributed.batch_isend_irecv(ops))
+        else:
+            out_works.append(
+                torch.distributed.all_to_all(
+                    [result[s * mine + a : s * mine + b] for s in range(world)],
+                    [sendout[d, a:b] for d in range(world)],
+                    group=tp_group,
+                    async_op=True,
+                )
             )
-        )
 
     for work in out_works:
         work.wait()
@@ -634,6 +715,7 @@ def newton_schulz_tp_subgroup(
     fused: bool = False,
     pipelined: bool = False,
     pipe_chunks: int = 4,
+    elide_self: bool = False,
 ) -> torch.Tensor:
     """``duplicated`` over ``world/subgroup_size`` disjoint subgroups of the owned set.
 
@@ -667,6 +749,12 @@ def newton_schulz_tp_subgroup(
     stack = stack.contiguous()
     count, rows, cols = stack.shape
 
+    if elide_self and not pipelined:
+        # Elision is a property of the pipelined (list-form, block-ownership) exchange
+        # only; a silent no-op on the monolithic path would let the arm be scored while
+        # running code that never elided anything.
+        raise ValueError("self-block elision requires the pipelined subgroup exchange")
+
     if pipelined:
         # Same deal, same math, restructured exchange -- see _subgroup_pipelined. Every
         # precondition is a hard error rather than a silent fallback, so the arm can never
@@ -687,8 +775,11 @@ def newton_schulz_tp_subgroup(
             raise RuntimeError(
                 "fused Newton-Schulz requested but kernels.fused_ns is unavailable"
             )
+        if elide_self and world < 2:
+            raise ValueError("self-block elision needs at least one real peer")
         return _subgroup_pipelined(
             stack, steps, coefficient_type, tp_group, use_syrk, fused, pipe_chunks,
+            elide_self=elide_self,
         )
 
     my_sub = rank // subgroup_size           # s_r
@@ -1082,7 +1173,7 @@ def time_fused_group(
 def time_group(
     stack, group, mode, steps, coefficient_type, iters, warmup, shard_count,
     use_syrk=False, batched=False, batch_chunk=0, subgroup_size=0, fused=False,
-    pipelined=False, pipe_chunks=4,
+    pipelined=False, pipe_chunks=4, elide_self=False,
 ) -> float:
     """Median wall-clock ms to orthogonalize a WHOLE same-shape group in one timed region.
 
@@ -1110,6 +1201,7 @@ def time_group(
                 fused=fused,
                 pipelined=pipelined,
                 pipe_chunks=pipe_chunks,
+                elide_self=elide_self,
             )
     elif batched:
         def once():
@@ -1250,6 +1342,21 @@ def main() -> None:
              "staging copies stop existing) and the per-chunk exchanges are issued "
              "async_op=True so the wire overlaps a different chunk's compute. Off by "
              "default, so without it the scored policy set is byte-identical to before.",
+    )
+    parser.add_argument(
+        "--elide-self-block",
+        action="store_true",
+        help="Under --pipelined-exchange, ALSO time each pipelined column with the "
+             f"rank's OWN block dropped from both exchanges ('...{ELIDE_SUFFIX}') and "
+             f"score '{PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY}' against the accepted "
+             "pipelined state. With shard_count = 2 on the egtp axis, HALF of every "
+             "exchange payload is the rank's own block; this drops it from the collective "
+             "and writes it locally into the buffer that consumes it (into the gather "
+             "buffer on the way in, into the result on the way out), which adds no HBM "
+             "traffic over the transposes the pipelined path already pays. Same deal, "
+             "same batched Newton-Schulz, same 5 steps / coefficients / SYRK path, same "
+             "pipeline depth -- the result is BIT-IDENTICAL. Off by default, so without "
+             "it the scored policy set is byte-identical to before.",
     )
     parser.add_argument(
         "--pipe-chunks",
@@ -1510,6 +1617,8 @@ def main() -> None:
     best_batch_subgroup_fused_for_shape: Dict[Tuple, str] = {}
     best_batch_subgroup_pipe_for_shape: Dict[Tuple, str] = {}
     pipe_reference_policy = PER_SHAPE_BATCH_SUBGROUP_POLICY
+    best_batch_subgroup_elide_for_shape: Dict[Tuple, str] = {}
+    elide_reference_policy = PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY
     # Cross-shape exchange fusion (--fuse-shape-exchanges). Unlike every other arm this is
     # a PER-PROFILE region, not a per-shape column, so it lives in its own maps.
     fused_region_ms: Dict[Tuple, Dict[str, float]] = {}
@@ -1518,6 +1627,7 @@ def main() -> None:
     fuse_arm = None
     fused_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     pipe_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
+    elide_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_replicated_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
@@ -1598,6 +1708,20 @@ def main() -> None:
                                 fused=config.fused_ns_kernel, pipelined=True,
                                 pipe_chunks=config.pipe_chunks,
                             )
+                            if config.elide_self_block:
+                                # Same arm, same tensors, same composition, same pipeline
+                                # depth -- only the self entry of each exchange differs.
+                                entry[batch_subgroup_policy(
+                                    g, fused=config.fused_ns_kernel, pipelined=True,
+                                    elide_self=True,
+                                )] = time_group(
+                                    stack, group, "duplicated", config.num_ns_steps,
+                                    config.coefficient_type, config.iters, config.warmup,
+                                    shard_count, config.use_syrk, subgroup_size=g,
+                                    batched=True, batch_chunk=config.batch_chunk,
+                                    fused=config.fused_ns_kernel, pipelined=True,
+                                    pipe_chunks=config.pipe_chunks, elide_self=True,
+                                )
                 group_ms[(matrix, count)] = entry
                 for policy, ms in entry.items():
                     log(
@@ -1820,6 +1944,42 @@ def main() -> None:
                         (banked, pipe_arm), key=lambda p: entry[p]
                     )
                 set_policies.append(PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY)
+            # --------------------------------------------------------------------------
+            # Scored self-block-elision policy (--elide-self-block).
+            #
+            # Reference is the ACCEPTED state after stage-3 phase 3:
+            # PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY. The only thing this policy changes
+            # relative to that reference is that a shape whose banked arm is a PIPELINED
+            # column may bank the ELIDED variant of that SAME arm. It never re-opens the g
+            # argmin, never un-pipelines, and never switches the fused/unfused compute
+            # path, so it cannot be credited with any win the reference already made --
+            # the delta is the self block and nothing else.
+            # --------------------------------------------------------------------------
+            if config.elide_self_block:
+                if not config.pipelined_exchange:
+                    raise ValueError(
+                        "--elide-self-block requires --pipelined-exchange: elision is "
+                        "defined on the pipelined exchange only"
+                    )
+                for matrix in distinct:
+                    banked = best_batch_subgroup_pipe_for_shape[matrix]
+                    best_batch_subgroup_elide_for_shape[matrix] = banked
+                    if not banked.endswith(PIPE_SUFFIX):
+                        # The reference did not bank a pipelined arm for this shape, so
+                        # there is no elided counterpart to substitute.
+                        continue
+                    biggest = sorted(needed.get(matrix, ()))[-1]
+                    entry = group_ms[(matrix, biggest)]
+                    elide_arm = banked + ELIDE_SUFFIX
+                    if elide_arm not in entry:
+                        continue
+                    elide_audit[matrix] = (
+                        banked, entry[banked], elide_arm, entry[elide_arm],
+                    )
+                    best_batch_subgroup_elide_for_shape[matrix] = min(
+                        (banked, elide_arm), key=lambda p: entry[p]
+                    )
+                set_policies.append(PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY)
         policies += set_policies
 
     def resolve(matrix, policy: str) -> str:
@@ -1842,6 +2002,8 @@ def main() -> None:
             return best_batch_subgroup_fused_for_shape[matrix]
         if policy == PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY:
             return best_batch_subgroup_pipe_for_shape[matrix]
+        if policy == PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY:
+            return best_batch_subgroup_elide_for_shape[matrix]
         if policy == PER_SHAPE_FUSED_EXCHANGE_POLICY:
             # The fusion never changes WHICH arm a shape runs -- it only merges the
             # regions of the shapes the reference already banked on a subgroup arm -- so
@@ -1854,6 +2016,8 @@ def main() -> None:
         """The underlying tp_mode a policy runs, for the FLOP model."""
         # The fused and pipelined arms issue identical arithmetic to the arm they suffix,
         # so they must map to the same tp_mode and be charged the same FLOPs.
+        if policy.endswith(ELIDE_SUFFIX):
+            policy = policy[: -len(ELIDE_SUFFIX)]
         if policy.endswith(PIPE_SUFFIX):
             policy = policy[: -len(PIPE_SUFFIX)]
         if policy.endswith(FUSED_SUFFIX):
@@ -2093,12 +2257,14 @@ def main() -> None:
                          PER_SHAPE_BATCH_SUBGROUP_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY,
+                         PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY,
                          PER_SHAPE_FUSED_EXCHANGE_POLICY)
             and not p.startswith(SUBGROUP_PREFIX)
             and not p.startswith(BATCH_SUBGROUP_PREFIX)
             and not p.startswith(FUSED_EXCHANGE_PREFIX)
             and not p.endswith(FUSED_SUFFIX)
             and not p.endswith(PIPE_SUFFIX)
+            and not p.endswith(ELIDE_SUFFIX)
             and not p.endswith(BALANCED_SUFFIX)
         ]
         baseline = min(baseline_pool, key=lambda p: max(totals[p]))
@@ -2312,6 +2478,43 @@ def main() -> None:
                         f"pipelined arm {p_sel} banked on {e} whose reference arm is "
                         f"{resolve(e, pipe_reference_policy)}"
                     )
+        if PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY in totals:
+            ref = max(totals[elide_reference_policy])
+            cand = max(totals[PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY])
+            log(
+                f"\nself-block-elision reference arm: {elide_reference_policy} "
+                f"({ref:.3f} ms)  <- the ACCEPTED state"
+            )
+            log(
+                f"self-block-elision candidate arm: "
+                f"{PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY} ({cand:.3f} ms), delta vs "
+                f"{elide_reference_policy} = {cand - ref:+.3f} ms, delta vs {baseline} = "
+                f"{cand - max(totals[baseline]):+.3f} ms"
+            )
+            log("  self-block-elision per-shape audit (largest owned count):")
+            log(
+                f"  {'all-gathered':>14}{'banked arm':>39}{'banked ms':>11}"
+                f"{'elided arm':>49}{'elide ms':>11}{'chosen':>49}"
+            )
+            for e in distinct:
+                if e not in elide_audit:
+                    continue
+                base_p, base_ms, arm_p, arm_ms = elide_audit[e]
+                log(
+                    f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{base_p:>39}{base_ms:>11.3f}"
+                    f"{arm_p:>49}{arm_ms:>11.3f}"
+                    f"{best_batch_subgroup_elide_for_shape[e]:>49}"
+                )
+            # An elided arm must never be banked where the reference did not already bank
+            # the very same arm unelided: the elision is a substitution, not a new arm.
+            for e, p_sel in best_batch_subgroup_elide_for_shape.items():
+                if p_sel.endswith(ELIDE_SUFFIX):
+                    assert p_sel[: -len(ELIDE_SUFFIX)] == resolve(
+                        e, elide_reference_policy), (
+                        f"elided arm {p_sel} banked on {e} whose reference arm is "
+                        f"{resolve(e, elide_reference_policy)}"
+                    )
+
         if PER_SHAPE_FUSED_EXCHANGE_POLICY in totals:
             ref = max(totals[fuse_reference_policy])
             cand = max(totals[PER_SHAPE_FUSED_EXCHANGE_POLICY])
@@ -2380,6 +2583,7 @@ def main() -> None:
                 PER_SHAPE_BATCH_POLICY, PER_SHAPE_BATCH_SUBGROUP_POLICY,
                 PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
                 PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY,
+                PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY,
                 PER_SHAPE_FUSED_EXCHANGE_POLICY):
         selection = {
             per_shape_policy: best_mode_for_shape,
@@ -2391,6 +2595,7 @@ def main() -> None:
             PER_SHAPE_BATCH_SUBGROUP_POLICY: best_batch_subgroup_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY: best_batch_subgroup_fused_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY: best_batch_subgroup_pipe_for_shape,
+            PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY: best_batch_subgroup_elide_for_shape,
             # The fusion changes no per-shape arm; it merges regions. Reported as the
             # reference's own selection plus the fused arm, printed below.
             PER_SHAPE_FUSED_EXCHANGE_POLICY: {

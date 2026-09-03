@@ -88,6 +88,24 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # the measured alpha_ib = 75.681 us costs +0.45 ms/region. All three arms come from THIS
 # one job over the SAME tensors under the SAME composition.
 #
+# --elide-self-block: times each g == 1 PIPELINED column a FOURTH time with the rank's OWN
+# block dropped from both exchanges ('duplicated_batch_sub_g1_fused_pipe_selfelide'), and
+# scores 'per_shape_batch_sub_elide_set' against the accepted 'per_shape_batch_sub_pipe_set'.
+# Identical deal, identical math, identical fused compute path, identical pipeline depth --
+# what changes is that the s == rank entry of each per-chunk exchange leaves the collective
+# (which becomes a peer-only batch_isend_irecv over the world - 1 real peers) and is served
+# by a local device write into the buffer that CONSUMES it: into the gather buffer `gx` on
+# the way in, into `result` on the way out. Both of those buffers were going to be written
+# by the transpose the pipelined path already pays, so no HBM traffic is added; what is
+# removed is the round trip of the own block through `recv`/`sendout`. The measured
+# transport probe (job 2892006, dist_muon_opt/stage-4/phase-1-egtp-selfblock-elide/
+# transport_probe.json) shows the self block was NOT on the wire at the region's real
+# payload (all_to_all_single 3.611 ms vs peer-only p2p 3.594 ms, ratio 1.005 against 2.0 if
+# it had been), so the win is the staging round trip, not wire bytes. The same job's
+# real-arm window at the region's real count of 192 measured -4.328 ms (5120x2048) and
+# -5.076 ms (2048x5120), bit-identical output. All four arms come from THIS one job over
+# the SAME tensors under the SAME composition.
+#
 # --set-timing: this axis owns 192 copies each of two expert shapes, so its cost is a
 # property of the SET, not of one matrix. It times the whole owned group inside one region
 # under two arms -- unbatched ('<mode>_set', the baseline) and batched ('duplicated_batch',
@@ -109,6 +127,7 @@ options=" \
     --fused-ns-kernel \
     --pipelined-exchange \
     --pipe-chunks ${EGTP_PIPE_CHUNKS:-4} \
+    --elide-self-block \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
