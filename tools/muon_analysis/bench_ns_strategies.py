@@ -85,11 +85,17 @@ try:
     if _FUSED_NS_PATH not in sys.path:
         sys.path.insert(0, _FUSED_NS_PATH)
     from kernels.fused_ns import FUSED_NS_AVAILABLE, fused_newton_schulz_batched
+    # ``fused_newton_schulz_batched`` falls back to the library ``newton_schulz`` whenever
+    # its preconditions do not hold, which makes it safe to enable unconditionally but ALSO
+    # makes a silent un-banking possible. A caller that SCORES the fusion as its own column
+    # imports the predicate and asserts it rather than assuming it.
+    from kernels.fused_ns import _supported as fused_ns_supported
 
     HAVE_FUSED_NS = FUSED_NS_AVAILABLE
 except Exception:  # pragma: no cover - absence is a supported configuration
     HAVE_FUSED_NS = False
     fused_newton_schulz_batched = None
+    fused_ns_supported = None
 
 # --------------------------------------------------------------------------------------
 # Weight shapes of the modelled workload: a 54-layer hybrid Mamba-MoE.
@@ -330,6 +336,7 @@ def newton_schulz_tp_batched(
     partition_dim: int | None,
     tp_mode: str,
     use_syrk: bool = False,
+    fused: bool = False,
 ) -> torch.Tensor:
     """Batched ``newton_schulz_tp`` over a stack of identically shaped local shards.
 
@@ -345,10 +352,39 @@ def newton_schulz_tp_batched(
     ``distributed_normalize_p2``, which reduces ``(x*x).sum()`` over the whole tensor; on a
     3-D stack that would normalize all B matrices by one shared Frobenius norm, which is a
     different computation, not a faster route to the same one.
+
+    ``fused`` routes the REPLICATED (``partition_dim is None``) branch through
+    ``kernels.fused_ns.fused_newton_schulz_batched`` instead of the library
+    ``newton_schulz``. Same 5-step chain, same polar_express coefficients, same batched
+    SYRK path, same batch dim -- the only difference is that the fp32 normalize + bf16 cast
+    prologue and the bf16 -> fp32 cast + store epilogue stop being separate HBM passes.
+    It is offered on the replicated branch ONLY: the collective branch's ``global_x`` is a
+    ``permute``d ``reshape`` and the fused entry point requires a contiguous input, so
+    enabling it there would silently fall back to the library call it is meant to replace.
     """
     if partition_dim is None:
         # Replicated weight: nothing to gather, same non-TP fallback newton_schulz_tp takes.
-        return newton_schulz(x, steps, coefficient_type, use_syrk=use_syrk)
+        if not fused:
+            return newton_schulz(x, steps, coefficient_type, use_syrk=use_syrk)
+        # Assert the fused preconditions rather than assume them: the entry point falls
+        # back to ``newton_schulz`` silently, which would time the reference arm under the
+        # candidate's name. This arm is scored, so the fallback must be an error here.
+        if not HAVE_FUSED_NS:
+            raise RuntimeError(
+                "fused Newton-Schulz requested but kernels.fused_ns is unavailable"
+            )
+        if not fused_ns_supported(x, coefficient_type, use_syrk):
+            raise RuntimeError(
+                "fused Newton-Schulz preconditions do not hold for the replicated batched "
+                f"path (shape={tuple(x.shape)}, dtype={x.dtype}, "
+                f"contiguous={x.is_contiguous()}, use_syrk={use_syrk}, "
+                f"fp32_matmul_precision={torch.get_float32_matmul_precision()}); the entry "
+                "point would silently fall back to newton_schulz and the column would not "
+                "measure the fusion"
+            )
+        return fused_newton_schulz_batched(
+            x, steps, coefficient_type, use_syrk=use_syrk,
+        )
     if tp_mode != "duplicated":
         raise ValueError(f"batched Newton-Schulz supports tp_mode='duplicated' only, got {tp_mode!r}")
     if partition_dim not in (0, 1):
@@ -448,6 +484,20 @@ PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY = "per_shape_sub_all_batch_set"
 FUSED_SUFFIX = "_fused"
 # The scored pair: reference is the accepted state PER_SHAPE_BATCH_SUBGROUP_POLICY.
 PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY = "per_shape_batch_sub_fused_set"
+# The replicated-batch FUSION candidate (--batch-replicated-fused). The shard_count == 1
+# shapes are the only ones whose banked arm is the plain ``duplicated_batch`` column, and
+# that column never received the fusion above: at partition_dim is None
+# ``newton_schulz_tp_batched`` short-circuits to the library ``newton_schulz`` on the 3-D
+# stack, so it still pays the fp32 normalize + bf16 cast prologue and the bf16 -> fp32 cast
+# + store epilogue as separate HBM passes. This column is the SAME batched call with the
+# same chunking, same 5 steps, same polar_express coefficients and the same batched SYRK
+# path -- only the per-chunk entry point differs, exactly as ``FUSED_SUFFIX`` means
+# everywhere else. Timed as its own column beside the unfused one, from the SAME job over
+# the SAME tensors under the SAME composition. Written as a suffix on BATCH_POLICY so
+# ``policy_mode`` strips it to ``duplicated`` and the FLOP model is unchanged.
+BATCH_FUSED_POLICY = BATCH_POLICY + FUSED_SUFFIX
+# The scored pair: reference is the accepted state PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY.
+PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY = "per_shape_sub_all_batch_fused_set"
 # The exchange-restructure candidate (--pipelined-exchange). Same subgroup deal, same
 # batched Newton-Schulz, same coefficients -- the ONLY difference is HOW the two subgroup
 # exchanges are staged and scheduled: block ownership makes the send/receive buffers views
@@ -1661,6 +1711,7 @@ def time_group(
                     partition_dim=partition_dim,
                     tp_mode=mode,
                     use_syrk=use_syrk,
+                    fused=fused,
                 )
     else:
         def once():
@@ -1910,6 +1961,20 @@ def main() -> None:
              "without it the scored policy set is byte-identical to before.",
     )
     parser.add_argument(
+        "--batch-replicated-fused",
+        action="store_true",
+        help="Additionally time the '" + BATCH_FUSED_POLICY + "' column on shard_count == 1 "
+             "(replicated) shapes -- the same batched Newton-Schulz with the same chunking, "
+             "routed through kernels.fused_ns.fused_newton_schulz_batched so the fp32 "
+             "normalize/cast prologue and the cast/store epilogue stop being separate HBM "
+             "passes -- and score '" + PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY + "', i.e. '"
+             + PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY + "' with that column substituted ONLY on "
+             "the shapes whose reference arm is already '" + BATCH_POLICY + "'. Requires "
+             "--batch-replicated-shapes. The fused entry point's silent fallback is an "
+             "ERROR on this path, not a no-op, so the column can never measure the "
+             "reference arm under the candidate's name. Off by default.",
+    )
+    parser.add_argument(
         "--batch-chunk",
         type=int,
         default=64,
@@ -1964,6 +2029,17 @@ def main() -> None:
         assert group_size % g == 0 and g < group_size, (
             f"--subgroup-sizes {g} must divide the {group_size}-rank group and be smaller "
             f"than it (g == group size is plain 'duplicated')."
+        )
+    if config.batch_replicated_fused:
+        assert config.batch_replicated_shapes, (
+            "--batch-replicated-fused requires --batch-replicated-shapes: the column it "
+            "substitutes is the replicated batched arm, which only enters a scored policy "
+            "there."
+        )
+        assert HAVE_FUSED_NS, (
+            "--batch-replicated-fused needs kernels.fused_ns (FUSED_NS_DIR); the arm routes "
+            "the replicated batched Newton-Schulz through the fused entry point and must "
+            "never silently score the unfused code it claims to replace."
         )
     if config.pipeline_fused_exchange:
         assert config.fuse_shape_exchanges, (
@@ -2061,6 +2137,16 @@ def main() -> None:
             f"the same substitution on EVERY shape that has a subgroup column, including "
             f"the ones whose winner is 'distributed{SET_SUFFIX}'. Costs no extra timing: "
             f"those columns are already measured for the table."
+        )
+    if config.batch_replicated_fused:
+        log(
+            f"batch_replicated_fused=True: also timing '{BATCH_FUSED_POLICY}' on "
+            f"shard_count == 1 shapes and scoring "
+            f"'{PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY}', i.e. "
+            f"'{PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY}' with that column substituted only "
+            f"where the reference already banked '{BATCH_POLICY}'. Same batched call, same "
+            f"chunking, same 5 steps, same coefficients, same batched SYRK path -- only "
+            f"the per-chunk entry point differs."
         )
     if config.batch_replicated_shapes:
         log(
@@ -2190,6 +2276,8 @@ def main() -> None:
     subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_replicated_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
+    batch_replicated_fused_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
+    best_subgroup_all_batch_fused_for_shape: Dict[Tuple, str] = {}
     if config.set_timing:
         # Every (shape, owned count) pair that appears in any rank profile, timed once.
         needed: Dict[Tuple, set] = {}
@@ -2222,6 +2310,20 @@ def main() -> None:
                         config.coefficient_type, config.iters, config.warmup, shard_count,
                         config.use_syrk, batched=True, batch_chunk=config.batch_chunk,
                     )
+                    if config.batch_replicated_fused and shard_count == 1:
+                        # Same arm, same tensors, same chunking, same composition -- only
+                        # the per-chunk Newton-Schulz entry point differs. shard_count == 1
+                        # only: at partition_dim is None the batched call short-circuits to
+                        # a local 3-D Newton-Schulz, which is the call the fusion replaces.
+                        # On a sharded shape the compute runs on a permuted reshape of the
+                        # all-gather buffer, which is not contiguous, so the fused entry
+                        # point's preconditions would not hold there.
+                        entry[BATCH_FUSED_POLICY] = time_group(
+                            stack, group, "duplicated", config.num_ns_steps,
+                            config.coefficient_type, config.iters, config.warmup,
+                            shard_count, config.use_syrk, batched=True,
+                            batch_chunk=config.batch_chunk, fused=True,
+                        )
                 # Subgroup duplication, one column per g. Timed on every shape so the
                 # column is readable, but SCORED only where noted below.
                 for g in subgroup_sizes:
@@ -2423,6 +2525,45 @@ def main() -> None:
                     f"{[m for m in banked if m[1] != 1]}"
                 )
                 set_policies.append(PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY)
+                # --------------------------------------------------------------------
+                # Scored replicated-batch FUSION policy (--batch-replicated-fused).
+                #
+                # Reference is the ACCEPTED state PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY.
+                # The ONLY thing this policy changes relative to it is that a shape whose
+                # reference arm is exactly ``duplicated_batch`` may bank the FUSED variant
+                # of that SAME column. It never re-opens the mode argmin, never re-opens
+                # the subgroup argmin and never touches a sharded shape, so it cannot be
+                # credited with any win the reference already made -- the delta is the
+                # prologue/epilogue fusion and nothing else.
+                # --------------------------------------------------------------------
+                if config.batch_replicated_fused:
+                    for matrix in distinct:
+                        banked_arm = best_subgroup_all_batch_for_shape[matrix]
+                        best_subgroup_all_batch_fused_for_shape[matrix] = banked_arm
+                        if banked_arm != BATCH_POLICY:
+                            # The reference did not bank the replicated batched column for
+                            # this shape, so there is no fused counterpart to substitute.
+                            continue
+                        biggest = sorted(needed.get(matrix, ()))[-1]
+                        entry = group_ms[(matrix, biggest)]
+                        if BATCH_FUSED_POLICY not in entry:
+                            continue
+                        batch_replicated_fused_audit[matrix] = (
+                            banked_arm, entry[banked_arm],
+                            BATCH_FUSED_POLICY, entry[BATCH_FUSED_POLICY],
+                        )
+                        best_subgroup_all_batch_fused_for_shape[matrix] = min(
+                            (banked_arm, BATCH_FUSED_POLICY), key=lambda p: entry[p]
+                        )
+                    fused_banked = [
+                        m for m, p in best_subgroup_all_batch_fused_for_shape.items()
+                        if p == BATCH_FUSED_POLICY
+                    ]
+                    assert all(m[1] == 1 for m in fused_banked), (
+                        f"{BATCH_FUSED_POLICY} banked on a sharded shape: "
+                        f"{[m for m in fused_banked if m[1] != 1]}"
+                    )
+                    set_policies.append(PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY)
         # ------------------------------------------------------------------------------
         # Scored batched-subgroup pair (--subgroup-batched).
         #
@@ -2622,6 +2763,8 @@ def main() -> None:
             return best_subgroup_all_for_shape[matrix]
         if policy == PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY:
             return best_subgroup_all_batch_for_shape[matrix]
+        if policy == PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY:
+            return best_subgroup_all_batch_fused_for_shape[matrix]
         if policy == PER_SHAPE_BATCH_POLICY:
             return best_batch_base_for_shape[matrix]
         if policy == PER_SHAPE_BATCH_SUBGROUP_POLICY:
@@ -2700,6 +2843,7 @@ def main() -> None:
     # ----------------------------------------------------------------------------------
     if config.set_timing and config.fuse_shape_exchanges:
         for _candidate in (
+            PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY,
             PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY,
             PER_SHAPE_SUBGROUP_ALL_POLICY,
             PER_SHAPE_SUBGROUP_POLICY,
@@ -2904,7 +3048,9 @@ def main() -> None:
             p for p in set_policies
             if p not in (BATCH_POLICY, PER_SHAPE_SUBGROUP_POLICY,
                          PER_SHAPE_SUBGROUP_ALL_POLICY,
-                         PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY, PER_SHAPE_BATCH_POLICY,
+                         PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY,
+                         PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY,
+                         PER_SHAPE_BATCH_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY,
@@ -3021,6 +3167,50 @@ def main() -> None:
                     f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{e[1]:>13}{base_p:>25}"
                     f"{base_ms:>10.3f}{arm_p:>19}{arm_ms:>12.3f}"
                     f"{best_subgroup_all_batch_for_shape[e]:>25}"
+                )
+        if PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY in set_policies:
+            # This candidate's scored pair. Its INCREMENTAL reference is the accepted state
+            # (per_shape_sub_all_batch_set), which already banked the replicated batched
+            # column; what is new here is routing THAT column through the fused entry
+            # point. Both arms come from this job, over the same tensors, under the same
+            # composition, so the pair can never be assembled from mismatched runs -- and
+            # because the shapes it touches are exactly the ones the cross-shape fused
+            # exchange never spans, the delta is additive onto the composed axis total.
+            cand = max(totals[PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY])
+            ref = max(totals[PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY])
+            log(
+                f"batch-replicated-fused reference arm (accepted state): "
+                f"{PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY} ({ref:.3f} ms)"
+            )
+            log(
+                f"batch-replicated-fused candidate arm: "
+                f"{PER_SHAPE_SUBGROUP_ALL_BATCH_FUSED_POLICY} ({cand:.3f} ms), delta vs "
+                f"{PER_SHAPE_SUBGROUP_ALL_BATCH_POLICY} = {cand - ref:+.3f} ms, delta vs "
+                f"{baseline} = {cand - max(totals[baseline]):+.3f} ms"
+            )
+            log(
+                "  batch-replicated-fused selection: "
+                + ", ".join(
+                    f"{e[0][0] * e[1]}x{e[0][1]}="
+                    f"{best_subgroup_all_batch_fused_for_shape[e]}"
+                    for e in distinct
+                )
+            )
+            audit_header = (
+                f"  {'all-gathered':>14}{'shard_count':>13}{'base policy':>25}"
+                f"{'base ms':>10}{'fused arm':>25}{'fused ms':>12}{'chosen':>25}"
+            )
+            log("  batch-replicated-fused per-shape audit (largest owned count, shapes "
+                f"whose reference arm is '{BATCH_POLICY}'):")
+            log(audit_header)
+            for e in distinct:
+                if e not in batch_replicated_fused_audit:
+                    continue
+                base_p, base_ms, arm_p, arm_ms = batch_replicated_fused_audit[e]
+                log(
+                    f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{e[1]:>13}{base_p:>25}"
+                    f"{base_ms:>10.3f}{arm_p:>25}{arm_ms:>12.3f}"
+                    f"{best_subgroup_all_batch_fused_for_shape[e]:>25}"
                 )
         if PER_SHAPE_BATCH_SUBGROUP_POLICY in set_policies:
             # This candidate's scored pair, printed so it is one grep away and can never be

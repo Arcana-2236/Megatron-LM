@@ -155,6 +155,27 @@ SUBGROUP_SIZES=${SUBGROUP_SIZES:-"4 8 16"}
 # HBM pass yet bought -0.813 ms. Halving the wire is not what this region is waiting on.
 # Cost reference for any future sweep: ~8.5 s of GPU time per extra arm (jobs 2892041 =
 # 6 fused arms / 12:50 vs 2892579 = 18 fused arms / 14:32).
+# --batch-replicated-fused: scores 'per_shape_sub_all_batch_fused_set' -- the accepted
+# 'per_shape_sub_all_batch_set' with ONE substitution, on the two shard_count == 1
+# (replicated) shapes only (8192x2048 at 24 owned, 512x8192 at 12): their banked
+# 'duplicated_batch' column is routed through kernels.fused_ns.fused_newton_schulz_batched
+# instead of the library newton_schulz. Those two rows never received stage-3's accepted
+# NS-step fusion, because at partition_dim is None newton_schulz_tp_batched short-circuits
+# to a local 3-D newton_schulz -- so they still pay the fp32 normalize + bf16 cast prologue
+# and the bf16 -> fp32 cast + store epilogue as separate HBM passes, which is why they are
+# the two worst '% of SOL' rows on this axis. Identical math: same batched call, same
+# --batch-chunk, same 5 steps, same polar_express coefficients, same batched SYRK path, no
+# collective anywhere near it (a replicated shape has nothing to gather). The candidate
+# column is timed BESIDE the arm it substitutes in this same job, over the same tensors,
+# under the same composition, so the delta is never a between-jobs one. The fused entry
+# point's silent fallback is a hard error on this path, so the column can never measure the
+# reference arm under the candidate's name. Set BATCH_REPLICATED_FUSED=0 to score the
+# pre-phase-6 state.
+BATCH_REPLICATED_FUSED_OPTION=""
+if [[ "${BATCH_REPLICATED_FUSED:-1}" == "1" ]]; then
+    BATCH_REPLICATED_FUSED_OPTION="--batch-replicated-fused"
+fi
+
 options=" \
     --group gtp \
     --modelled-world-size 128 \
@@ -172,6 +193,7 @@ options=" \
     --pipeline-fused-exchange \
     --fused-pipe-chunks ${FUSED_PIPE_CHUNKS:-2 4} \
     --fused-wire-modes ${FUSED_WIRE_MODES:-} \
+    ${BATCH_REPLICATED_FUSED_OPTION} \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
