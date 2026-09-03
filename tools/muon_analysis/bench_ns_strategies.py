@@ -473,6 +473,37 @@ ELIDE_SUFFIX = "_selfelide"
 # The scored pair: reference is PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY, the state stage-3
 # phase 3 banked.
 PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY = "per_shape_batch_sub_elide_set"
+# The return-wire-precision candidate (--subgroup-wire-modes). Same subgroup deal, same
+# batched Newton-Schulz, same coefficients, same block ownership, same pipeline depth,
+# same self-block treatment -- the ONLY difference is the TRANSPORT ENCODING of the
+# OUTPUT leg: the reply that carries each peer's row block of the orthogonalized result
+# travels as bf16 and is widened into the fp32 ``result`` inside the timed region.
+#
+# This is BITWISE, not a tolerance argument. ``fused_newton_schulz_batched`` keeps ``X``
+# in bf16 through all five polar_express steps and widens only at its ``_cast_into``
+# epilogue (kernels/fused_ns.py), so EVERY value it returns is exactly bf16-representable
+# -- measured, not asserted: stage-4's ``preflight_wire_bf16.csv`` reports
+# ``output_bf16_exact_frac = 1.000000`` on all seven hot shapes, both axes. Narrowing that
+# value to bf16 and widening it back is the identity, so the returned tensor must be
+# BIT-IDENTICAL to the arm this one suffixes.
+#
+# Only the OUTPUT leg is offered. The input leg was refuted at zero scored cost by the
+# same pre-flight (EGTP max_abs_diff 1.221e-3 against the 1e-3 equivalence gate), and it
+# is not bitwise: it would perturb every entry before the Newton-Schulz prologue.
+#
+# Suffix goes LAST, after ELIDE_SUFFIX, so an arm reads
+# ``duplicated_batch_sub_g1_fused_pipe_selfelide_wbf16out``; ``policy_mode`` strips all
+# four. Off by default, so the scored policy set is byte-identical to the accepted state
+# unless the flag is passed.
+#
+# mode -> dtype of the output leg. Deliberately NOT ``WIRE_MODES`` (the GTP
+# fused-exchange dict, which also offers input-leg modes): an input-leg mode on this
+# exchange is a hard ValueError here rather than a silently-fp32 no-op.
+SUBGROUP_WIRE_MODES = {"bf16out": torch.bfloat16}
+# The scored pair: reference is whichever of the accepted arms the run has enabled --
+# PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY when --elide-self-block is on, else the pipelined
+# policy.
+PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY = "per_shape_batch_sub_wire_set"
 
 
 def subgroup_policy(subgroup_size: int) -> str:
@@ -481,13 +512,14 @@ def subgroup_policy(subgroup_size: int) -> str:
 
 def batch_subgroup_policy(
     subgroup_size: int, fused: bool = False, pipelined: bool = False,
-    elide_self: bool = False,
+    elide_self: bool = False, wire: str = "",
 ) -> str:
     return (
         f"{BATCH_SUBGROUP_PREFIX}{subgroup_size}"
         + (FUSED_SUFFIX if fused else "")
         + (PIPE_SUFFIX if pipelined else "")
         + (ELIDE_SUFFIX if elide_self else "")
+        + (f"{WIRE_SUFFIX}{wire}" if wire else "")
     )
 
 
@@ -547,6 +579,7 @@ def _subgroup_pipelined(
     fused: bool,
     pipe_chunks: int,
     elide_self: bool = False,
+    wire_out=None,
 ) -> torch.Tensor:
     """``newton_schulz_tp_subgroup`` at ``subgroup_size == 1``, pipelined and staging-free.
 
@@ -572,7 +605,20 @@ def _subgroup_pipelined(
     # peer-major again for the output exchange. Only ``recv``/``sendout`` are full size --
     # they hold the in-flight chunks -- while the compute buffers are one chunk each.
     recv = torch.empty((world, mine, rows, cols), dtype=stack.dtype, device=stack.device)
-    sendout = torch.empty((world, mine, rows, cols), dtype=stack.dtype, device=stack.device)
+    # Transport encoding of the OUTPUT leg only. ``stack.dtype`` (fp32) is the COMPUTE
+    # dtype and never changes: ``gx`` stays fp32 so ``fused_ns._supported`` still holds and
+    # the accepted fusion cannot silently un-bank, and ``result`` stays fp32 so the region
+    # returns exactly the tensor type it always did. Bitwise, because the fused kernel's
+    # output is exactly bf16-representable -- see SUBGROUP_WIRE_MODES.
+    out_wire = wire_out or stack.dtype
+    sendout = torch.empty((world, mine, rows, cols), dtype=out_wire, device=stack.device)
+    # Landing buffer for a narrowed output leg. The reply cannot land directly in
+    # ``result`` when the wire is narrower than it, so this is the one genuinely new
+    # full-size pass the arm pays, and it is INSIDE the timed region by construction.
+    recvout = (
+        None if out_wire is stack.dtype
+        else torch.empty((world, mine, rows, cols), dtype=out_wire, device=stack.device)
+    )
     gx = torch.empty((chunk, world * rows, cols), dtype=stack.dtype, device=stack.device)
     tmp = (
         torch.empty((chunk, world * rows, cols), dtype=stack.dtype, device=stack.device)
@@ -627,13 +673,34 @@ def _subgroup_pipelined(
 
     in_works = [None] * len(windows)
     in_works[0] = issue_input(0)
-    out_works = []
+    # (works, a, b) per in-flight output window. The window bounds are carried because a
+    # narrowed wire needs a widening pass once that window has landed.
+    out_works: List[Tuple[list, int, int]] = []
+
+    def drain_output(pending):
+        """Wait one output window and, on a narrowed wire, widen it into ``result``."""
+        works, a, b = pending
+        for work in works:
+            work.wait()
+        if recvout is None:
+            return
+        # The upcast. One strided pass per window over the peer blocks only -- the self
+        # block (under ``elide_self``) was written into ``result`` in fp32 already and is
+        # not on the wire. Kept per-window rather than one pass at the end so it overlaps
+        # the next window's exchange instead of trailing it.
+        for s in peers:
+            result[s * mine + a : s * mine + b].copy_(recvout[s, a:b])
 
     for ci, (a, b) in enumerate(windows):
         # Prefetch: chunk ci+1's input exchange goes on the wire BEFORE this chunk's
         # compute is issued, so it overlaps it. Every rank issues the same sequence.
         if ci + 1 < len(windows):
             in_works[ci + 1] = issue_input(ci + 1)
+        # Retire output windows at a lag of two, matching the input pipeline's depth: the
+        # newest one was issued at the end of the previous iteration and is left in
+        # flight, so nothing here waits on a wire that has only just been handed to NCCL.
+        while len(out_works) > 1:
+            drain_output(out_works.pop(0))
         for work in in_works[ci]:
             work.wait()
         in_works[ci] = None
@@ -675,29 +742,37 @@ def _subgroup_pipelined(
             sendout[:, a:b].copy_(y.view(n, world, rows, cols).transpose(0, 1))
         del y
         # Peer s owns matrices [s * mine, (s + 1) * mine); its reply for window [a, b)
-        # lands DIRECTLY in the output slice -- no scatter copy.
+        # lands DIRECTLY in the output slice -- no scatter copy. On a narrowed wire it
+        # lands in ``recvout`` instead and ``drain_output`` widens it into that same slice.
+        def out_dst(s):
+            return (
+                result[s * mine + a : s * mine + b] if recvout is None
+                else recvout[s, a:b]
+            )
+
         if elide_self:
             ops = []
             for s in peers:
                 ops.append(torch.distributed.P2POp(
-                    torch.distributed.irecv,
-                    result[s * mine + a : s * mine + b], global_peer[s], tp_group))
+                    torch.distributed.irecv, out_dst(s), global_peer[s], tp_group))
                 ops.append(torch.distributed.P2POp(
                     torch.distributed.isend, sendout[s, a:b], global_peer[s], tp_group))
             if ops:
-                out_works.extend(torch.distributed.batch_isend_irecv(ops))
+                out_works.append((torch.distributed.batch_isend_irecv(ops), a, b))
         else:
-            out_works.append(
-                torch.distributed.all_to_all(
-                    [result[s * mine + a : s * mine + b] for s in range(world)],
+            out_works.append((
+                [torch.distributed.all_to_all(
+                    [out_dst(s) for s in range(world)],
                     [sendout[d, a:b] for d in range(world)],
                     group=tp_group,
                     async_op=True,
-                )
-            )
+                )],
+                a,
+                b,
+            ))
 
-    for work in out_works:
-        work.wait()
+    while out_works:
+        drain_output(out_works.pop(0))
     return result
 
 
@@ -716,6 +791,7 @@ def newton_schulz_tp_subgroup(
     pipelined: bool = False,
     pipe_chunks: int = 4,
     elide_self: bool = False,
+    wire: str = "",
 ) -> torch.Tensor:
     """``duplicated`` over ``world/subgroup_size`` disjoint subgroups of the owned set.
 
@@ -755,6 +831,27 @@ def newton_schulz_tp_subgroup(
         # running code that never elided anything.
         raise ValueError("self-block elision requires the pipelined subgroup exchange")
 
+    if wire and not pipelined:
+        # A wire encoding is a property of the pipelined (list-form) exchange only. A
+        # silent fp32 no-op on the monolithic path would let the arm be scored while
+        # running code that never narrowed anything -- the same hazard the elision guard
+        # above closes.
+        raise ValueError("subgroup wire encoding requires the pipelined subgroup exchange")
+    if wire and wire not in SUBGROUP_WIRE_MODES:
+        raise ValueError(
+            f"unknown subgroup wire mode {wire!r}; known: "
+            f"{sorted(SUBGROUP_WIRE_MODES)}"
+        )
+    if wire and not fused:
+        # The bitwise property is a property of the FUSED kernel's output (every value it
+        # returns is exactly bf16-representable because it holds X in bf16 across all five
+        # steps). The library path's fp32 output carries no such guarantee, so narrowing
+        # its return leg would be a tolerance change wearing a bitwise arm's name.
+        raise ValueError(
+            "subgroup wire encoding is defined on the fused compute path only: the "
+            "bitwise property comes from fused_newton_schulz_batched's bf16 X"
+        )
+
     if pipelined:
         # Same deal, same math, restructured exchange -- see _subgroup_pipelined. Every
         # precondition is a hard error rather than a silent fallback, so the arm can never
@@ -780,6 +877,7 @@ def newton_schulz_tp_subgroup(
         return _subgroup_pipelined(
             stack, steps, coefficient_type, tp_group, use_syrk, fused, pipe_chunks,
             elide_self=elide_self,
+            wire_out=SUBGROUP_WIRE_MODES[wire] if wire else None,
         )
 
     my_sub = rank // subgroup_size           # s_r
@@ -936,14 +1034,29 @@ BALANCED_SUFFIX = "_bal"
 # untouched, so the policy can never re-bank anything the reference already chose.
 PER_SHAPE_FUSED_EXCHANGE_POLICY = "per_shape_fuse_sub_set"
 
+# Wire precision of the two fused-exchange legs (--fused-wire-modes). The suffix goes LAST,
+# after the pipeline depth, so an arm reads ``fuse_sub_g4_bal_pipe2_wbf16``; it is a
+# TRANSPORT encoding only -- the deal, the matrices, the step count, the coefficients and
+# the SYRK path are identical to the arm it suffixes, and every widening/narrowing rides a
+# copy the pipelined path already pays. ``bf16in`` is the input leg alone, which carries
+# 4/5 of the region's wire bytes at subgroup_size = 4 (see WIRE_MODES below).
+WIRE_SUFFIX = "_w"
+# mode -> (input-leg dtype, output-leg dtype); "" is the unmodified fp32 wire.
+WIRE_MODES = {
+    "bf16": (torch.bfloat16, torch.bfloat16),
+    "bf16in": (torch.bfloat16, None),
+    "bf16out": (None, torch.bfloat16),
+}
+
 
 def fused_exchange_policy(
-    subgroup_size: int, balanced: bool = False, pipe_chunks: int = 0
+    subgroup_size: int, balanced: bool = False, pipe_chunks: int = 0, wire: str = ""
 ) -> str:
     return (
         f"{FUSED_EXCHANGE_PREFIX}{subgroup_size}"
         + (BALANCED_SUFFIX if balanced else "")
         + (f"{PIPE_SUFFIX}{pipe_chunks}" if pipe_chunks else "")
+        + (f"{WIRE_SUFFIX}{wire}" if wire else "")
     )
 
 
@@ -1043,6 +1156,8 @@ def _fused_exchange_pipelined(
     dtype,
     device,
     pipe_chunks: int,
+    wire_in=None,
+    wire_out=None,
 ) -> List[torch.Tensor]:
     """``newton_schulz_tp_subgroup_fused`` with the exchange chunked, async and unstaged.
 
@@ -1051,6 +1166,11 @@ def _fused_exchange_pipelined(
     """
     world = tp_group.size()
     n_shapes = len(stacks)
+    # Transport encoding of each leg, independent of the COMPUTE dtype (``dtype``), which
+    # never changes: ``gx`` is fp32 so ``fused_ns._supported`` still holds, and ``results``
+    # is fp32 so the region's return value has the same type it always had.
+    wire_in = wire_in or dtype
+    wire_out = wire_out or dtype
 
     # ---- windows: contiguous slices of each subgroup's flat, SHAPE-MAJOR item list ------
     # Shape-major is not a choice: it is the order the monolithic path's send buffer and
@@ -1098,7 +1218,16 @@ def _fused_exchange_pipelined(
         torch.empty((counts[i], dims[i][0], dims[i][1]), dtype=dtype, device=device)
         for i in range(n_shapes)
     ]
-    empty = torch.empty(0, dtype=dtype, device=device)
+    empty = torch.empty(0, dtype=wire_out, device=device)
+
+    # Send-side narrowing for the input leg. ``index_select(..., out=)`` needs a matching
+    # dtype, so the cast cannot ride the gather; it is done ONCE per shape per region here
+    # rather than once per (subgroup, chunk) gather, which is the same number of elements
+    # touched either way (every matrix is staged exactly once) but one allocation and one
+    # pass instead of many. Freed as soon as the last window is on the wire.
+    wire_stacks = list(stacks)
+    if wire_in is not dtype:
+        wire_stacks = [stack.to(wire_in) for stack in stacks]
 
     def issue_input(c: int):
         """Stage window ``c`` ONCE per destination SUBGROUP and put it on the wire."""
@@ -1107,7 +1236,7 @@ def _fused_exchange_pipelined(
         for s in range(groups):
             offs.append(total)
             total += sizes[s]
-        stage = torch.empty(total, dtype=dtype, device=device)
+        stage = torch.empty(total, dtype=wire_in, device=device)
         cursor = 0
         for s in range(groups):
             for i in range(n_shapes):
@@ -1118,13 +1247,13 @@ def _fused_exchange_pipelined(
                 rows, cols = dims[i]
                 span = n * elems[i]
                 torch.index_select(
-                    stacks[i], 0,
+                    wire_stacks[i], 0,
                     perm[i][runbase[i][s] + lo : runbase[i][s] + hi],
                     out=stage[cursor : cursor + span].view(n, rows, cols),
                 )
                 cursor += span
         recv_n = blk(my_sub, c)
-        recv = torch.empty(world * recv_n, dtype=dtype, device=device)
+        recv = torch.empty(world * recv_n, dtype=wire_in, device=device)
         recv_v = recv.view(world, recv_n)
         # Destination d needs its SUBGROUP's block; the g ranks of a subgroup are handed
         # the SAME staged tensor rather than g copies of it.
@@ -1154,6 +1283,9 @@ def _fused_exchange_pipelined(
             src = recv_v[:, offset : offset + span].unflatten(1, (n, rows, cols))
             offset += span
             gx = torch.empty((n, world * rows, cols), dtype=dtype, device=device)
+            # ``gx`` is fp32 whatever the wire is: ``fused_ns._supported`` rejects a bf16
+            # input outright, and the widening rides THIS copy -- the transposing pass the
+            # pipeline already pays -- whose READ side halves when the wire is bf16.
             gx.view(n, world, rows, cols).copy_(src.permute(1, 0, 2, 3))
             y = fused_newton_schulz_batched(
                 gx, steps, coefficient_type, use_syrk=use_syrk,
@@ -1162,7 +1294,9 @@ def _fused_exchange_pipelined(
             del gx
             ys.append((i, n, y))
 
-        sendout = torch.empty(groups * recv_n, dtype=dtype, device=device)
+        # Narrowing for the output leg rides the strided ``copy_`` below, which the
+        # pipelined path already pays; only its WRITE side changes width.
+        sendout = torch.empty(groups * recv_n, dtype=wire_out, device=device)
         send_v = sendout.view(groups, recv_n)
         offset = 0
         for i, n, y in ys:
@@ -1182,7 +1316,7 @@ def _fused_exchange_pipelined(
         for s in range(groups):
             offs.append(total)
             total += sizes[s]
-        outbuf = torch.empty(total, dtype=dtype, device=device)
+        outbuf = torch.empty(total, dtype=wire_out, device=device)
         out_list, in_list = [], []
         for r in range(world):
             if r % subgroup_size == my_slot:
@@ -1205,6 +1339,9 @@ def _fused_exchange_pipelined(
         # is issued, so it overlaps it. Every rank issues the same sequence.
         if c + 1 < n_chunks:
             pending_in[c + 1] = issue_input(c + 1)
+        else:
+            # Every window is staged; drop the bf16 send-side copy before compute peaks.
+            wire_stacks = None
         work, recv, recv_n, stage = pending_in[c]
         pending_in[c] = None
         work.wait()
@@ -1226,10 +1363,17 @@ def _fused_exchange_pipelined(
                     continue
                 rows, cols = dims[i]
                 span = n * elems[i]
+                block = outbuf[cursor : cursor + span].view(n, rows, cols)
+                if block.dtype is not dtype:
+                    # ``index_copy_`` requires self and source to share a dtype, so unlike
+                    # the other three widenings this one cannot ride an existing copy: the
+                    # output leg buys half its wire bytes at the price of one extra pass
+                    # over the received block. That is why ``bf16in`` is a separate arm.
+                    block = block.to(dtype)
                 results[i].index_copy_(
                     0,
                     perm[i][runbase[i][s] + lo : runbase[i][s] + hi],
-                    outbuf[cursor : cursor + span].view(n, rows, cols),
+                    block,
                 )
                 cursor += span
     return results
@@ -1245,6 +1389,7 @@ def newton_schulz_tp_subgroup_fused(
     balanced: bool = False,
     pipelined: bool = False,
     pipe_chunks: int = 0,
+    wire: str = "",
 ) -> List[torch.Tensor]:
     """Subgroup duplication over SEVERAL shapes at once, with one pair of exchanges.
 
@@ -1299,6 +1444,15 @@ def newton_schulz_tp_subgroup_fused(
 
     my_block = sub_elems(my_sub)
 
+    if wire and wire not in WIRE_MODES:
+        raise ValueError(f"unknown fused wire mode {wire!r}; known: {sorted(WIRE_MODES)}")
+    if wire and not pipelined:
+        # The four widening/narrowing sites the wire modes ride are all inside
+        # ``_fused_exchange_pipelined``; the monolithic path stages through ``cat``/``stack``
+        # and would have to pay a NEW pass for each. A silent fp32 fallback would let a
+        # bf16-wire arm be scored while running the fp32 wire, so this is a hard error.
+        raise ValueError("fused wire modes require the pipelined fused exchange")
+
     if pipelined:
         # Same deal (``owners`` above), same math, restructured exchange -- see
         # ``_fused_exchange_pipelined``. A silent fallback here would let the arm be scored
@@ -1312,10 +1466,11 @@ def newton_schulz_tp_subgroup_fused(
                 "pipelined fused exchange requires kernels.fused_ns; it batches the "
                 "per-matrix Newton-Schulz loop through the fused entry point"
             )
+        wire_in, wire_out = WIRE_MODES.get(wire, (None, None)) if wire else (None, None)
         return _fused_exchange_pipelined(
             stacks, steps, coefficient_type, tp_group, use_syrk,
             subgroup_size, groups, my_sub, my_slot, owned, counts, dims, elems,
-            dtype, device, pipe_chunks,
+            dtype, device, pipe_chunks, wire_in, wire_out,
         )
 
     # ---- ONE input exchange over every shape ------------------------------------------
@@ -1420,7 +1575,7 @@ def newton_schulz_tp_subgroup_fused(
 
 def time_fused_group(
     stacks, group, steps, coefficient_type, iters, warmup, use_syrk=False,
-    subgroup_size=0, balanced=False, pipelined=False, pipe_chunks=0,
+    subgroup_size=0, balanced=False, pipelined=False, pipe_chunks=0, wire="",
 ) -> float:
     """Median wall-clock ms for ONE fused region spanning several owned shape groups.
 
@@ -1440,6 +1595,7 @@ def time_fused_group(
             balanced=balanced,
             pipelined=pipelined,
             pipe_chunks=pipe_chunks,
+            wire=wire,
         )
 
     for _ in range(warmup):
@@ -1463,7 +1619,7 @@ def time_fused_group(
 def time_group(
     stack, group, mode, steps, coefficient_type, iters, warmup, shard_count,
     use_syrk=False, batched=False, batch_chunk=0, subgroup_size=0, fused=False,
-    pipelined=False, pipe_chunks=4, elide_self=False,
+    pipelined=False, pipe_chunks=4, elide_self=False, wire="",
 ) -> float:
     """Median wall-clock ms to orthogonalize a WHOLE same-shape group in one timed region.
 
@@ -1492,6 +1648,7 @@ def time_group(
                 pipelined=pipelined,
                 pipe_chunks=pipe_chunks,
                 elide_self=elide_self,
+                wire=wire,
             )
     elif batched:
         def once():
@@ -1649,6 +1806,27 @@ def main() -> None:
              "it the scored policy set is byte-identical to before.",
     )
     parser.add_argument(
+        "--subgroup-wire-modes",
+        nargs="*",
+        default=[],
+        metavar="MODE",
+        help="Under --pipelined-exchange, ALSO time each pipelined (and, with "
+             f"--elide-self-block, each elided) column with the OUTPUT leg of the "
+             f"exchange encoded at the given wire precision ('...{'_w'}<mode>', modes: "
+             f"{', '.join(sorted(SUBGROUP_WIRE_MODES))}) and score "
+             f"'{PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY}' against the accepted state. The "
+             "reply that carries each peer's row block of the orthogonalized result "
+             "travels as bf16 and is widened into the fp32 result INSIDE the timed "
+             "region. Same deal, same batched Newton-Schulz, same 5 steps / coefficients "
+             "/ SYRK path, same pipeline depth, same self-block treatment; the compute "
+             "dtype and the returned dtype are untouched. BITWISE: the fused kernel holds "
+             "X in bf16 across all five steps and widens only at its epilogue, so every "
+             "value on that wire is exactly bf16-representable. Empty by default, so "
+             "without it the scored policy set is byte-identical to before; an unknown "
+             "mode, a wire mode without --pipelined-exchange, or one on the unfused "
+             "compute path is a hard ValueError, never a silent fp32 fallback.",
+    )
+    parser.add_argument(
         "--pipe-chunks",
         type=int,
         default=4,
@@ -1698,6 +1876,28 @@ def main() -> None:
              "is bounded by that; N = 1 degenerates to no overlap. Each N raises the "
              "collective count per region to 2*N and the results scatter to N times "
              "groups*shapes writes, so the sweep is what prices the tradeoff.",
+    )
+    parser.add_argument(
+        "--fused-wire-modes",
+        type=str,
+        nargs="*",
+        default=[],
+        choices=sorted(WIRE_MODES),
+        help="Under --pipeline-fused-exchange, ALSO time each pipelined fused column with "
+             f"the named TRANSPORT encoding ('...{WIRE_SUFFIX}<mode>'), in the SAME job "
+             "over the SAME tensors under the SAME composition, fed to the SAME fused-arm "
+             "argmin. 'bf16' puts both exchange legs on the wire in bfloat16, 'bf16in' the "
+             "input leg only (which carries 4/5 of the region's wire bytes at "
+             "subgroup_size = 4) and 'bf16out' the output leg only. COMPUTE dtype is "
+             "unchanged in every mode: the gather buffer stays fp32 so the fused kernel's "
+             "preconditions hold, and the region still returns fp32. Three of the four "
+             "width changes ride copies the pipelined path already pays (the send gather, "
+             "the transposing receive copy, the strided send-out copy); the fourth, the "
+             "scatter into results, costs one extra pass, which is why the legs are "
+             "separable arms. The OUTPUT leg is bitwise -- the fused kernel's epilogue "
+             "upcasts a bf16 X, so its values are exactly bf16-representable -- while the "
+             "INPUT leg perturbs every entry before the Newton-Schulz prologue and is "
+             "gated on the equivalence check, not assumed. Off by default.",
     )
     parser.add_argument(
         "--batch-replicated-shapes",
@@ -1777,6 +1977,33 @@ def main() -> None:
             "--pipeline-fused-exchange needs kernels.fused_ns (FUSED_NS_DIR); the arm "
             "batches the per-matrix Newton-Schulz loop through the fused entry point and "
             "must never silently score the unfused code it claims to replace."
+        )
+    if config.fused_wire_modes:
+        assert config.pipeline_fused_exchange, (
+            "--fused-wire-modes requires --pipeline-fused-exchange: the widenings the "
+            "modes ride only exist in the pipelined fused exchange."
+        )
+        assert config.dtype == "float32", (
+            "--fused-wire-modes changes the TRANSPORT encoding of an fp32 region; it is "
+            f"undefined at --dtype {config.dtype}."
+        )
+    if config.subgroup_wire_modes:
+        assert config.pipelined_exchange, (
+            "--subgroup-wire-modes requires --pipelined-exchange: the exchange whose "
+            "output leg is re-encoded only exists in the pipelined subgroup path."
+        )
+        assert config.fused_ns_kernel, (
+            "--subgroup-wire-modes requires --fused-ns-kernel: the bitwise property comes "
+            "from fused_newton_schulz_batched holding X in bf16 across all five steps."
+        )
+        unknown = [w for w in config.subgroup_wire_modes if w not in SUBGROUP_WIRE_MODES]
+        assert not unknown, (
+            f"unknown --subgroup-wire-modes {unknown}; known: "
+            f"{sorted(SUBGROUP_WIRE_MODES)}"
+        )
+        assert config.dtype == "float32", (
+            "--subgroup-wire-modes changes the TRANSPORT encoding of an fp32 region; it "
+            f"is undefined at --dtype {config.dtype}."
         )
     if config.subgroup_batched:
         assert config.set_timing and subgroup_sizes, (
@@ -1948,6 +2175,8 @@ def main() -> None:
     pipe_reference_policy = PER_SHAPE_BATCH_SUBGROUP_POLICY
     best_batch_subgroup_elide_for_shape: Dict[Tuple, str] = {}
     elide_reference_policy = PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY
+    best_batch_subgroup_wire_for_shape: Dict[Tuple, str] = {}
+    wire_reference_policy = PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY
     # Cross-shape exchange fusion (--fuse-shape-exchanges). Unlike every other arm this is
     # a PER-PROFILE region, not a per-shape column, so it lives in its own maps.
     fused_region_ms: Dict[Tuple, Dict[str, float]] = {}
@@ -1957,6 +2186,7 @@ def main() -> None:
     fused_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     pipe_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     elide_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
+    wire_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_subgroup_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
     batch_replicated_audit: Dict[Tuple, Tuple[str, float, str, float]] = {}
@@ -2051,6 +2281,30 @@ def main() -> None:
                                     fused=config.fused_ns_kernel, pipelined=True,
                                     pipe_chunks=config.pipe_chunks, elide_self=True,
                                 )
+                            # Wire-encoding columns: one per (self-block treatment, mode).
+                            # Same arm, same tensors, same composition, same pipeline
+                            # depth, same self-block treatment -- only the TRANSPORT
+                            # encoding of the output leg differs. Timed against BOTH the
+                            # pipelined and the elided column so the wire delta is
+                            # separable from the elision whichever one the reference
+                            # banked.
+                            for w in config.subgroup_wire_modes:
+                                for es in (
+                                    (False, True) if config.elide_self_block else (False,)
+                                ):
+                                    entry[batch_subgroup_policy(
+                                        g, fused=config.fused_ns_kernel, pipelined=True,
+                                        elide_self=es, wire=w,
+                                    )] = time_group(
+                                        stack, group, "duplicated", config.num_ns_steps,
+                                        config.coefficient_type, config.iters,
+                                        config.warmup, shard_count, config.use_syrk,
+                                        subgroup_size=g, batched=True,
+                                        batch_chunk=config.batch_chunk,
+                                        fused=config.fused_ns_kernel, pipelined=True,
+                                        pipe_chunks=config.pipe_chunks, elide_self=es,
+                                        wire=w,
+                                    )
                 group_ms[(matrix, count)] = entry
                 for policy, ms in entry.items():
                     log(
@@ -2309,6 +2563,51 @@ def main() -> None:
                         (banked, elide_arm), key=lambda p: entry[p]
                     )
                 set_policies.append(PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY)
+            # --------------------------------------------------------------------------
+            # Scored return-wire-precision policy (--subgroup-wire-modes).
+            #
+            # Reference is the ACCEPTED state: the elision policy when --elide-self-block
+            # is on, else the pipelined policy. The only thing this policy changes
+            # relative to that reference is that a shape whose banked arm is a pipelined
+            # (optionally elided) column may bank the WIRE-ENCODED variant of that SAME
+            # arm. It never re-opens the g argmin, never un-pipelines, never changes the
+            # self-block treatment and never switches the fused/unfused compute path, so
+            # the delta is the output leg's encoding and nothing else.
+            # --------------------------------------------------------------------------
+            if config.subgroup_wire_modes:
+                wire_reference_policy = (
+                    PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY if config.elide_self_block
+                    else PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY
+                )
+                reference_selection = (
+                    best_batch_subgroup_elide_for_shape if config.elide_self_block
+                    else best_batch_subgroup_pipe_for_shape
+                )
+                for matrix in distinct:
+                    banked = reference_selection[matrix]
+                    best_batch_subgroup_wire_for_shape[matrix] = banked
+                    if not (banked.endswith(PIPE_SUFFIX)
+                            or banked.endswith(ELIDE_SUFFIX)):
+                        # The reference did not bank a pipelined arm for this shape, so
+                        # there is no wire-encoded counterpart to substitute.
+                        continue
+                    biggest = sorted(needed.get(matrix, ()))[-1]
+                    entry = group_ms[(matrix, biggest)]
+                    arms = [banked] + [
+                        banked + WIRE_SUFFIX + w
+                        for w in config.subgroup_wire_modes
+                        if banked + WIRE_SUFFIX + w in entry
+                    ]
+                    if len(arms) < 2:
+                        continue
+                    best_wire = min(arms[1:], key=lambda p: entry[p])
+                    wire_audit[matrix] = (
+                        banked, entry[banked], best_wire, entry[best_wire],
+                    )
+                    best_batch_subgroup_wire_for_shape[matrix] = min(
+                        arms, key=lambda p: entry[p]
+                    )
+                set_policies.append(PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY)
         policies += set_policies
 
     def resolve(matrix, policy: str) -> str:
@@ -2333,6 +2632,8 @@ def main() -> None:
             return best_batch_subgroup_pipe_for_shape[matrix]
         if policy == PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY:
             return best_batch_subgroup_elide_for_shape[matrix]
+        if policy == PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY:
+            return best_batch_subgroup_wire_for_shape[matrix]
         if policy == PER_SHAPE_FUSED_EXCHANGE_POLICY:
             # The fusion never changes WHICH arm a shape runs -- it only merges the
             # regions of the shapes the reference already banked on a subgroup arm -- so
@@ -2345,6 +2646,10 @@ def main() -> None:
         """The underlying tp_mode a policy runs, for the FLOP model."""
         # The fused and pipelined arms issue identical arithmetic to the arm they suffix,
         # so they must map to the same tp_mode and be charged the same FLOPs.
+        for _w in set(WIRE_MODES) | set(SUBGROUP_WIRE_MODES):
+            if policy.endswith(f"{WIRE_SUFFIX}{_w}"):
+                policy = policy[: -len(_w) - len(WIRE_SUFFIX)]
+                break
         if policy.endswith(ELIDE_SUFFIX):
             policy = policy[: -len(ELIDE_SUFFIX)]
         if policy.endswith(PIPE_SUFFIX):
@@ -2436,7 +2741,7 @@ def main() -> None:
                     "ns_cost.)"
                 )
                 fused_header = (
-                    f"  {'profile':>8}{'shapes':>8}{'matrices':>10}{'arm':>22}"
+                    f"  {'profile':>8}{'shapes':>8}{'matrices':>10}{'arm':>30}"
                     f"{'fused ms':>11}{'per-shape sum ms':>18}{'delta ms':>11}"
                 )
                 log(fused_header)
@@ -2465,17 +2770,25 @@ def main() -> None:
                                 list(config.fused_pipe_chunks)
                                 if config.pipeline_fused_exchange else []
                             )
-                            for pc in depths:
-                                arm = fused_exchange_policy(g, balanced, pc)
+                            # (pc, wire): wire = "" is the fp32 wire this axis has always
+                            # run; the rest are transport encodings of the SAME arm, timed
+                            # here so the argmin ranges over them under one composition.
+                            variants = [
+                                (pc, w)
+                                for pc in depths
+                                for w in ([""] + list(config.fused_wire_modes) if pc else [""])
+                            ]
+                            for pc, wire in variants:
+                                arm = fused_exchange_policy(g, balanced, pc, wire)
                                 entry[arm] = time_fused_group(
                                     stacks, group, config.num_ns_steps,
                                     config.coefficient_type, config.iters, config.warmup,
                                     config.use_syrk, subgroup_size=g, balanced=balanced,
-                                    pipelined=bool(pc), pipe_chunks=pc,
+                                    pipelined=bool(pc), pipe_chunks=pc, wire=wire,
                                 )
                                 log(
                                     f"  {p_index:>8}{len(fused):>8}"
-                                    f"{sum(n for _, n in fused):>10}{arm:>22}"
+                                    f"{sum(n for _, n in fused):>10}{arm:>30}"
                                     f"{entry[arm]:>11.3f}{reference_sum:>18.3f}"
                                     f"{entry[arm] - reference_sum:>+11.3f}"
                                 )
@@ -2596,6 +2909,7 @@ def main() -> None:
                          PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY,
                          PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY,
+                         PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY,
                          PER_SHAPE_FUSED_EXCHANGE_POLICY)
             and not p.startswith(SUBGROUP_PREFIX)
             and not p.startswith(BATCH_SUBGROUP_PREFIX)
@@ -2852,6 +3166,61 @@ def main() -> None:
                         f"elided arm {p_sel} banked on {e} whose reference arm is "
                         f"{resolve(e, elide_reference_policy)}"
                     )
+        if PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY in totals:
+            ref = max(totals[wire_reference_policy])
+            cand = max(totals[PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY])
+            log(
+                f"\nreturn-wire reference arm: {wire_reference_policy} "
+                f"({ref:.3f} ms)  <- the ACCEPTED state"
+            )
+            log(
+                f"return-wire candidate arm: "
+                f"{PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY} ({cand:.3f} ms), delta vs "
+                f"{wire_reference_policy} = {cand - ref:+.3f} ms, delta vs {baseline} = "
+                f"{cand - max(totals[baseline]):+.3f} ms"
+            )
+            log("  return-wire per-shape audit (largest owned count):")
+            log(
+                f"  {'all-gathered':>14}{'banked arm':>49}{'banked ms':>11}"
+                f"{'wire arm':>59}{'wire ms':>11}{'chosen':>59}"
+            )
+            for e in distinct:
+                if e not in wire_audit:
+                    continue
+                base_p, base_ms, arm_p, arm_ms = wire_audit[e]
+                log(
+                    f"  {f'{e[0][0] * e[1]}x{e[0][1]}':>14}{base_p:>49}{base_ms:>11.3f}"
+                    f"{arm_p:>59}{arm_ms:>11.3f}"
+                    f"{best_batch_subgroup_wire_for_shape[e]:>59}"
+                )
+            # Every wire arm on every shape, so a negative outcome is diagnosable and the
+            # per-mode split is visible rather than collapsed into the argmin.
+            log("  return-wire all-arm table (group ms at the largest owned count):")
+            for e in distinct:
+                biggest = sorted(needed.get(e, ()))[-1]
+                entry = group_ms[(e, biggest)]
+                arms = sorted(
+                    a for a in entry
+                    if any(WIRE_SUFFIX + w in a for w in SUBGROUP_WIRE_MODES)
+                )
+                if not arms:
+                    continue
+                log(
+                    f"    {f'{e[0][0] * e[1]}x{e[0][1]}':>14}: "
+                    + ", ".join(f"{a}={entry[a]:.3f}" for a in arms)
+                )
+            # A wire-encoded arm must never be banked where the reference did not already
+            # bank the very same arm at fp32: the encoding is a substitution, not a new
+            # arm, and it must not change the self-block treatment or the compute path.
+            for e, p_sel in best_batch_subgroup_wire_for_shape.items():
+                for w in SUBGROUP_WIRE_MODES:
+                    suffix = WIRE_SUFFIX + w
+                    if p_sel.endswith(suffix):
+                        assert p_sel[: -len(suffix)] == resolve(
+                            e, wire_reference_policy), (
+                            f"wire arm {p_sel} banked on {e} whose reference arm is "
+                            f"{resolve(e, wire_reference_policy)}"
+                        )
 
         if PER_SHAPE_FUSED_EXCHANGE_POLICY in totals:
             ref = max(totals[fuse_reference_policy])
@@ -2922,6 +3291,7 @@ def main() -> None:
                 PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY,
                 PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY,
                 PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY,
+                PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY,
                 PER_SHAPE_FUSED_EXCHANGE_POLICY):
         selection = {
             per_shape_policy: best_mode_for_shape,
@@ -2934,6 +3304,7 @@ def main() -> None:
             PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY: best_batch_subgroup_fused_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_PIPE_POLICY: best_batch_subgroup_pipe_for_shape,
             PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY: best_batch_subgroup_elide_for_shape,
+            PER_SHAPE_BATCH_SUBGROUP_WIRE_POLICY: best_batch_subgroup_wire_for_shape,
             # The fusion changes no per-shape arm; it merges regions. Reported as the
             # reference's own selection plus the fused arm, printed below.
             PER_SHAPE_FUSED_EXCHANGE_POLICY: {

@@ -106,6 +106,45 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # -5.076 ms (2048x5120), bit-identical output. All four arms come from THIS one job over
 # the SAME tensors under the SAME composition.
 #
+# --subgroup-wire-modes: adds the stage-4 phase-4 candidate `egtp-wire-bf16-return` as
+# FURTHER COLUMNS of the same region -- one per (self-block treatment, wire mode) -- timed
+# in the SAME job over the SAME tensors under the SAME composition and scored as
+# 'per_shape_batch_sub_wire_set' against the accepted 'per_shape_batch_sub_elide_set'.
+# What changes is the TRANSPORT encoding of the OUTPUT leg only: the reply that carries
+# each peer's row block of the orthogonalized result travels as bf16 and is widened into
+# the fp32 `result` inside the timed region (one strided pass per pipeline window, drained
+# at a lag of two so it overlaps the next window's exchange rather than trailing it).
+# COMPUTE precision is untouched: `gx` is still fp32 so kernels.fused_ns._supported still
+# holds and the accepted fusion cannot silently un-bank, the 5 polar_express steps, the
+# SYRK path, the deal and the pipeline depth are identical, and the region still returns
+# fp32 in INPUT order.
+#
+# BITWISE, and measured rather than argued: fused_newton_schulz_batched holds X in bf16
+# through all five steps and widens only at its _cast_into epilogue, so every value on
+# that wire is exactly bf16-representable -- stage-4's preflight_wire_bf16.csv reports
+# output_bf16_exact_frac = 1.000000 on all seven hot shapes, both axes.
+#
+# Only the OUTPUT leg is offered. The input leg (plan rank 5, `egtp-wire-bf16-input`) was
+# refuted at zero scored cost by that same pre-flight: EGTP max_abs_diff 1.221e-3 against
+# the 1e-3 equivalence gate.
+#
+# ACCEPTED and BANKED (job 2894899, 07:46). The argmin selected
+# `duplicated_batch_sub_g1_fused_pipe_selfelide_wbf16out` on BOTH shapes and the EGTP axis
+# went 118.128 -> 99.012 ms, per_shape_batch_sub_elide_set -> per_shape_batch_sub_wire_set
+# = -19.117 ms, from the SAME job over the SAME tensors under the SAME composition. Per
+# region: 2048x5120 59.049 -> 49.410 (-9.639), 5120x2048 59.079 -> 49.602 (-9.477). That
+# clears the 5.17 ms EGTP axis nondeterminism floor by 3.70x, and it is 2.4x the -8.0 ms
+# the candidate was priced at -- the pricing charged +4.3 ms for a receive-side upcast the
+# pipeline turns out to absorb, because the widening is drained at a lag of two windows and
+# so overlaps the next window's exchange instead of trailing the last one.
+#
+# `bf16out` is therefore the DEFAULT here. Set EGTP_SUBGROUP_WIRE_MODES="" to score the
+# pre-phase-4 state, or to a longer mode list to re-open the argmin:
+#   sbatch --export=ALL,USE_SYRK=1,EGTP_SUBGROUP_WIRE_MODES="" \
+#          tools/muon_analysis/bench_ns_egtp.sbatch
+# An unknown mode, a mode without --pipelined-exchange, or one on the unfused compute path
+# is a hard ValueError in the benchmark, never a silent fp32 fallback.
+#
 # --set-timing: this axis owns 192 copies each of two expert shapes, so its cost is a
 # property of the SET, not of one matrix. It times the whole owned group inside one region
 # under two arms -- unbatched ('<mode>_set', the baseline) and batched ('duplicated_batch',
@@ -128,6 +167,7 @@ options=" \
     --pipelined-exchange \
     --pipe-chunks ${EGTP_PIPE_CHUNKS:-4} \
     --elide-self-block \
+    --subgroup-wire-modes ${EGTP_SUBGROUP_WIRE_MODES-bf16out} \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \

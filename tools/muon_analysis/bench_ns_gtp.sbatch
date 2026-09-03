@@ -120,6 +120,41 @@ SUBGROUP_SIZES=${SUBGROUP_SIZES:-"4 8 16"}
 # Identical math: same deal, same matrices, same 5 steps, same polar_express coefficients,
 # same SYRK path, and each shape still returns this rank's slice of every matrix in INPUT
 # order. Off by default in the benchmark, so the flag is what turns it on here.
+# --fused-wire-modes: adds the stage-4 phase-3 candidate `gtp-wire-bf16` as further EXTRA
+# COLUMNS of the fused-exchange region -- one per (pipeline depth, wire mode) -- timed in
+# the SAME job over the SAME tensors under the SAME composition and fed to the SAME
+# fused-arm argmin as every other fused column. The region moves fp32 on both exchange legs
+# today (--dtype defaults to float32) while every GEMM inside it runs bf16; these arms move
+# bf16 instead. COMPUTE precision is untouched in every mode: the gather buffer handed to
+# the fused Newton-Schulz kernel is still fp32 (so kernels.fused_ns._supported still holds
+# and the fusion cannot silently un-bank), the 5 polar_express steps, the SYRK path and the
+# deal are identical, and the region still returns fp32 in INPUT order. Three of the four
+# width changes ride copies the pipelined path already pays; the scatter into `results` is
+# the one that costs an extra pass, which is why the legs are timed as SEPARABLE arms:
+#   bf16out  output leg only -- BITWISE. The fused kernel keeps X in bf16 through all five
+#            steps and only widens at its epilogue, so every value it returns is exactly
+#            bf16-representable. Measured, not argued: preflight_wire_bf16.csv reports
+#            output_bf16_exact_frac = 1.000000 on all five GTP shapes.
+#   bf16in   input leg only -- carries 4/5 of the region's wire bytes at subgroup_size = 4
+#            (per rank the input leg receives world * my_block, the output leg groups *
+#            my_block, i.e. 64 : 16). Perturbs every entry before the Newton-Schulz
+#            prologue, so it is gated on the equivalence check.
+#   bf16     both legs.
+# Off by default in the benchmark AND empty by default here, so the scored policy set is
+# byte-identical to the accepted state unless FUSED_WIRE_MODES is set. It is left wired
+# rather than removed because the phase-3 measurement is what settled the question and must
+# stay reproducible in one command:
+#   sbatch --export=ALL,USE_SYRK=1,FUSED_WIRE_MODES="bf16 bf16in bf16out" \
+#          tools/muon_analysis/bench_ns_gtp.sbatch
+# MEASURED AND NOT BANKED (job 2894159, 54 fused arms, 18:41). At the real 64-rank region
+# the whole win is -1.750 ms on a 64.357 ms region (fuse_sub_g4_bal_pipe2 64.357 ->
+# _wbf16 62.607) and -1.493 ms on the GTP axis (82.070 -> 80.577), against the 2.70 ms
+# GTP conservative nondeterminism floor -- it does not clear it, so the arm is not adopted.
+# The per-leg split also refutes the byte model the candidate was priced on: bf16in carries
+# 4/5 of the wire bytes and bought -0.605 ms, while bf16out carries 1/5 AND pays an extra
+# HBM pass yet bought -0.813 ms. Halving the wire is not what this region is waiting on.
+# Cost reference for any future sweep: ~8.5 s of GPU time per extra arm (jobs 2892041 =
+# 6 fused arms / 12:50 vs 2892579 = 18 fused arms / 14:32).
 options=" \
     --group gtp \
     --modelled-world-size 128 \
@@ -136,6 +171,7 @@ options=" \
     --fuse-shape-exchanges \
     --pipeline-fused-exchange \
     --fused-pipe-chunks ${FUSED_PIPE_CHUNKS:-2 4} \
+    --fused-wire-modes ${FUSED_WIRE_MODES:-} \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
