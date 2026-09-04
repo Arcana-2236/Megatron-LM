@@ -15,7 +15,7 @@
 #SBATCH --account=coreai_dlalgo_llm
 #SBATCH --nodes=16
 #SBATCH --exclusive
-#SBATCH -t 00:30:00
+#SBATCH -t 00:45:00
 #SBATCH --mem=0
 # No --gpus-per-node: Lyris rejects it as an invalid gres spec. --exclusive gives all
 # 4 GPUs on the node.
@@ -51,7 +51,25 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # SUBGROUP_SIZES: duplication-group sizes g for the subgroup-duplication arms. Each must
 # divide GTP and be smaller than it, so a reduced-degree smoke run must override this too,
 # e.g. sbatch --nodes=2 --segment=2 --export=ALL,GTP=8,SUBGROUP_SIZES="2 4" ...
-SUBGROUP_SIZES=${SUBGROUP_SIZES:-"4 8 16"}
+#
+# g = 1 and g = 2 added (stage-5 phase-1 `gtp-subgroup-size-g1g2`). The sweep had only ever
+# run g in {4, 8, 16}, yet g is a REPLICATION factor: a duplication group of g ranks all
+# orthogonalize the whole matrix, so the compute term of every subgroup arm grows ~linearly
+# in g while the wire term shrinks only slightly. The measured fused-region table is
+# monotone in exactly that direction and never reached the small end -- profile 1 read
+# fuse_sub_g16_bal_pipe2 = 221.830, g8 = 115.904, g4 = 64.660 (job 2896176), i.e. ~2x per
+# halving of g, with the banked winner sitting at the SMALLEST g ever measured.
+# g = 1 makes each rank its own group (owner-computes, the design the EGTP axis already
+# runs); g = 2 halves the replication while keeping two ranks per group so the greedy-LPT
+# deal still has slack. Both are legal: newton_schulz_tp_subgroup{,_fused} reject only
+# groups == 1 (g == world), and the world-4 window has run fuse_sub_g1_pipe2 BITWISE against
+# the per-matrix duplicated lineage since phase-3.
+# Zero new code path: these are two more columns of the SAME sweep, fed to the SAME
+# per-shape / per-profile argmin, so a column that loses cannot change the scored policy.
+# The physical risk is the other way -- at small g the deal has fewer matrices per group
+# than groups, so the region floors at ONE whole matrix and LPT imbalance can eat the win;
+# that is why g = 2 is swept beside g = 1 rather than instead of it.
+SUBGROUP_SIZES=${SUBGROUP_SIZES:-"1 2 4 8 16"}
 
 # --subgroup-all-shapes: scores a SECOND subgroup policy, 'per_shape_sub_all_set'. It is
 # the same substitution rule as the already-accepted 'per_shape_sub_set' but applied on
