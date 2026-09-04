@@ -189,6 +189,39 @@ SUBGROUP_SIZES=${SUBGROUP_SIZES:-"1 2 4 8 16"}
 # point's silent fallback is a hard error on this path, so the column can never measure the
 # reference arm under the candidate's name. Set BATCH_REPLICATED_FUSED=0 to score the
 # pre-phase-6 state.
+# FUSED_DIST_IN_GROUP_SIZES: duplication-group sizes g that ALSO get a distribute-in-group
+# column of the fused-exchange region (stage-5 phase-2 `gtp-distribute-in-group-g2`).
+#
+# g is a REPLICATION factor: at `fuse_sub_g<g>` all g ranks of a duplication subgroup
+# orthogonalize the WHOLE matrix. Phase 1 drove g down to 1 for exactly that reason and the
+# region landed at 49.604 ms -- but the measured table is FLAT between g = 1 (49.604) and
+# g = 2 (49.967) even though g = 2 does twice the arithmetic, which is the signature of a
+# region bound by its LPT critical path (one 36864x8192 matrix) rather than by aggregate
+# throughput: at both g the largest subgroup load is that single matrix, and 51 of 64 ranks
+# wait on the rank that owns it.
+#
+# `fuse_sub_g<g>_dist...` breaks that floor instead of trading against it: inside a subgroup
+# each rank keeps its OWN slab of a tall matrix and the g ranks cooperate -- one Gram
+# all-reduce per Newton-Schulz step -- so the biggest matrix's critical path shards g ways
+# and the balanced deal (which charges a distributed shape its per-rank fraction) can
+# actually balance. Wire is unchanged from g = 1: a distributed shape's shard goes to ONE
+# rank of each subgroup, not to all g. Wide-once-gathered shapes stay replicated in the
+# subgroup, so their exchange, staging and compute are the pre-existing path byte for byte.
+# Identical math otherwise: same 5 steps, same polar_express coefficients, same SYRK path,
+# same whiten-the-smaller-dimension orientation, and each shape still returns this rank's
+# slice of every matrix in INPUT order. The two numeric deviations -- the Frobenius norm
+# summed over shards (in fp64) and the Gram summed over g partial products -- are the ones
+# `tp_mode="distributed"` already has and are what the world-4 window's equivalence gate
+# measures (scripts/check_dist_in_group.py).
+# Empty this to score the pre-phase-2 state exactly:
+#   sbatch --export=ALL,USE_SYRK=1,FUSED_DIST_IN_GROUP_SIZES= ...
+# g = 2 and g = 4 are both swept: the win is a balance win, and it is not monotone in g.
+# Distributing shrinks a TALL shape's per-rank arithmetic by ~(3/g + M/N)/(3 + M/N) but a
+# WIDE shape is still replicated g ways, so the wide half of the region grows linearly in g
+# while the tall half shrinks -- g = 2 is the modelled optimum and g = 4 is swept beside it
+# so the argmin, not the model, decides. ~8.5 s of GPU time per extra arm.
+FUSED_DIST_IN_GROUP_SIZES=${FUSED_DIST_IN_GROUP_SIZES-2 4}
+
 BATCH_REPLICATED_FUSED_OPTION=""
 if [[ "${BATCH_REPLICATED_FUSED:-1}" == "1" ]]; then
     BATCH_REPLICATED_FUSED_OPTION="--batch-replicated-fused"
@@ -211,6 +244,7 @@ options=" \
     --pipeline-fused-exchange \
     --fused-pipe-chunks ${FUSED_PIPE_CHUNKS:-2 4} \
     --fused-wire-modes ${FUSED_WIRE_MODES:-} \
+    --fused-dist-in-group-sizes ${FUSED_DIST_IN_GROUP_SIZES} \
     ${BATCH_REPLICATED_FUSED_OPTION} \
     ${SYRK_OPTION} "
 
