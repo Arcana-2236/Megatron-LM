@@ -70,16 +70,16 @@ try:
 except ImportError:
     HAVE_EMERGING_OPTIMIZERS = False
 
-# Optional: the fused batched Newton-Schulz kernel from the optimization workspace
-# (``dist_muon_opt/kernels/fused_ns.py``). It is a drop-in for the ``newton_schulz`` call
-# the batched-subgroup compute loop makes, with the fp32 normalize/cast prologue and the
+# Optional: the fused batched Newton-Schulz kernel in ``kernels/fused_ns.py`` beside this
+# file. It is a drop-in for the ``newton_schulz`` call the batched-subgroup compute loop
+# makes, with the fp32 normalize/cast prologue and the
 # bf16->fp32 epilogue-plus-store fused into two Triton passes each. The 5-step chain
 # itself is untouched (same coefficients, same batched SYRK path, same step count); only
-# the surrounding full-size fp32 traffic changes. Imported by path so the benchmark keeps
-# running unchanged in a tree that has no workspace beside it.
+# the surrounding full-size fp32 traffic changes. Imported by path -- defaulting to this
+# file's own directory, so a fresh clone of the repo is self-contained; override with
+# FUSED_NS_DIR to point at a workspace copy instead.
 _FUSED_NS_PATH = os.environ.get(
-    "FUSED_NS_DIR",
-    "/lustre/fsw/coreai_dlalgo_llm/zhengywang/dist_muon_proxy_ootb/dist_muon_opt",
+    "FUSED_NS_DIR", os.path.dirname(os.path.abspath(__file__))
 )
 try:
     if _FUSED_NS_PATH not in sys.path:
@@ -104,9 +104,9 @@ except Exception:  # pragma: no cover - absence is a supported configuration
     in_group_shard_factor = None
     fused_ns_supported = None
 
-# Optional: the 24-bit split transport codec (``dist_muon_opt/kernels/wire24.py``), used by
+# Optional: the 24-bit split transport codec (``tools/muon_analysis/kernels/wire24.py``), used by
 # the ``24in`` subgroup wire modes to carry the INPUT leg in 3 bytes per fp32 element
-# instead of 4. Same import-by-path contract as the fused kernel above: absent workspace ->
+# instead of 4. Same import-by-path contract as the fused kernel above: absent codec ->
 # the modes that need it are a hard error, never a silent fp32 fallback.
 try:
     from kernels.wire24 import WIRE24_AVAILABLE, pack24, unpack24
@@ -2134,7 +2134,7 @@ def main() -> None:
         "--fused-ns-kernel",
         action="store_true",
         help="Under --subgroup-batched, ALSO time each batched-subgroup column with the "
-             "fused Newton-Schulz entry point from dist_muon_opt/kernels/fused_ns.py "
+             "fused Newton-Schulz entry point from tools/muon_analysis/kernels/fused_ns.py "
              f"('{BATCH_SUBGROUP_PREFIX}<g>{FUSED_SUFFIX}') and score "
              f"'{PER_SHAPE_BATCH_SUBGROUP_FUSED_POLICY}' against the accepted state "
              f"'{PER_SHAPE_BATCH_SUBGROUP_POLICY}'. Identical math -- same 5 steps, same "
@@ -2436,7 +2436,7 @@ def main() -> None:
         ]
         assert not needs24 or HAVE_WIRE24, (
             f"--subgroup-wire-modes {needs24} need the 24-bit split codec "
-            "(dist_muon_opt/kernels/wire24.py), which is unavailable here. Failing at "
+            "(tools/muon_analysis/kernels/wire24.py), which is unavailable here. Failing at "
             "config time rather than silently scoring a full-width input leg."
         )
     if config.subgroup_batched:

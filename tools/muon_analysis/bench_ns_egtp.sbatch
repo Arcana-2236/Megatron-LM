@@ -64,7 +64,7 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # The script sweeps every rank profile itself and reports the slowest, so nothing to pick.
 #
 # --fused-ns-kernel: times each batched-subgroup column a SECOND time with the fused
-# Newton-Schulz entry point from dist_muon_opt/kernels/fused_ns.py, and scores
+# Newton-Schulz entry point from tools/muon_analysis/kernels/fused_ns.py, and scores
 # 'per_shape_batch_sub_fused_set' against the accepted 'per_shape_batch_sub_set'. Identical
 # math -- same 5 steps, same polar_express coefficients, same batched Triton SYRK path --
 # with the fp32 Frobenius-normalize + bf16 cast prologue and the bf16->fp32 cast + store
@@ -144,7 +144,7 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # the un-orthogonalized matrix each rank ships to the owner, 2.013 of the 3.02 GB/rank/
 # region and the only leg still at full width -- as a 24-bit split: the bf16 high half of
 # each fp32 word plus the next 8 mantissa bits, in a bf16 buffer and a uint8 buffer riding
-# the same batched p2p call (dist_muon_opt/kernels/wire24.py). 3 bytes per element instead
+# the same batched p2p call (tools/muon_analysis/kernels/wire24.py). 3 bytes per element instead
 # of 4, i.e. -25 % on that leg and -16.7 % of the region's wire term.
 #
 # Unlike `bf16out` this one is LOSSY -- it clears the low 8 of fp32's 24 mantissa bits
