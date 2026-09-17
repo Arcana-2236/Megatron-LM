@@ -104,6 +104,19 @@ except Exception:  # pragma: no cover - absence is a supported configuration
     in_group_shard_factor = None
     fused_ns_supported = None
 
+# Optional: the 24-bit split transport codec (``dist_muon_opt/kernels/wire24.py``), used by
+# the ``24in`` subgroup wire modes to carry the INPUT leg in 3 bytes per fp32 element
+# instead of 4. Same import-by-path contract as the fused kernel above: absent workspace ->
+# the modes that need it are a hard error, never a silent fp32 fallback.
+try:
+    from kernels.wire24 import WIRE24_AVAILABLE, pack24, unpack24
+
+    HAVE_WIRE24 = WIRE24_AVAILABLE
+except Exception:  # pragma: no cover - absence is a supported configuration
+    HAVE_WIRE24 = False
+    pack24 = None
+    unpack24 = None
+
 # --------------------------------------------------------------------------------------
 # Weight shapes of the modelled workload: a 54-layer hybrid Mamba-MoE.
 #
@@ -544,19 +557,36 @@ PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY = "per_shape_batch_sub_elide_set"
 # value to bf16 and widening it back is the identity, so the returned tensor must be
 # BIT-IDENTICAL to the arm this one suffixes.
 #
-# Only the OUTPUT leg is offered. The input leg was refuted at zero scored cost by the
-# same pre-flight (EGTP max_abs_diff 1.221e-3 against the 1e-3 equivalence gate), and it
-# is not bitwise: it would perturb every entry before the Newton-Schulz prologue.
+# PLAIN bf16 on the INPUT leg is not offered and never will be: it was refuted at zero
+# scored cost by the same pre-flight (EGTP max_abs_diff 1.221e-3 against the 1e-3
+# equivalence gate) because it perturbs every entry before the Newton-Schulz prologue with
+# only 8 mantissa bits. ``bf16out24in`` re-opens that leg with 16 mantissa bits instead --
+# a different mechanism with ~256x the headroom against the same gate, and its own
+# pre-flight (scripts/preflight_wire24.py) rather than an inherited verdict.
 #
 # Suffix goes LAST, after ELIDE_SUFFIX, so an arm reads
 # ``duplicated_batch_sub_g1_fused_pipe_selfelide_wbf16out``; ``policy_mode`` strips all
 # four. Off by default, so the scored policy set is byte-identical to the accepted state
 # unless the flag is passed.
 #
-# mode -> dtype of the output leg. Deliberately NOT ``WIRE_MODES`` (the GTP
-# fused-exchange dict, which also offers input-leg modes): an input-leg mode on this
-# exchange is a hard ValueError here rather than a silently-fp32 no-op.
-SUBGROUP_WIRE_MODES = {"bf16out": torch.bfloat16}
+# mode -> (OUTPUT-leg dtype, INPUT-leg codec). Deliberately NOT ``WIRE_MODES`` (the GTP
+# fused-exchange dict): the encodings offered here are the ones whose numerics have been
+# gated on THIS axis, and anything else is a hard ValueError rather than a silently-fp32
+# no-op.
+#
+# ``bf16out``    -- stage-4, ACCEPTED and banked. Output leg only, BITWISE.
+# ``bf16out24in`` -- stage-5 rank 4 ``egtp-wire-24bit-input-leg``. Same bitwise output leg,
+#   PLUS the input leg carried as a 24-bit split (bf16 high half + the next 8 mantissa
+#   bits, ``kernels/wire24.py``): 3 bytes per element instead of 4, a 25 % cut on the only
+#   leg still at full width. Unlike the output leg this one is LOSSY -- it clears the low 8
+#   of fp32's 24 mantissa bits after a round-to-nearest-even, ~2^-16 relative error -- and
+#   is therefore a TOLERANCE row, gated by the workload's atol = rtol = 1e-3 through the
+#   real 5-step chain (scripts/preflight_wire24.py), not a bitwise one. Plain bf16 on this
+#   leg was refuted at 1.221e-3 (stage-4 phase-5); this keeps 8 more mantissa bits.
+SUBGROUP_WIRE_MODES = {
+    "bf16out": (torch.bfloat16, ""),
+    "bf16out24in": (torch.bfloat16, "split24"),
+}
 # The scored pair: reference is whichever of the accepted arms the run has enabled --
 # PER_SHAPE_BATCH_SUBGROUP_ELIDE_POLICY when --elide-self-block is on, else the pipelined
 # policy.
@@ -637,6 +667,7 @@ def _subgroup_pipelined(
     pipe_chunks: int,
     elide_self: bool = False,
     wire_out=None,
+    wire_in_codec: str = "",
 ) -> torch.Tensor:
     """``newton_schulz_tp_subgroup`` at ``subgroup_size == 1``, pipelined and staging-free.
 
@@ -661,7 +692,31 @@ def _subgroup_pipelined(
     # Peer-major landing buffer for the input exchange, matrix-major buffers for compute,
     # peer-major again for the output exchange. Only ``recv``/``sendout`` are full size --
     # they hold the in-flight chunks -- while the compute buffers are one chunk each.
-    recv = torch.empty((world, mine, rows, cols), dtype=stack.dtype, device=stack.device)
+    # Transport encoding of the INPUT leg. ``""`` is the accepted full-width wire: the
+    # send side is a VIEW of ``stack`` (no packing copy at all) and the receive side lands
+    # fp32 in ``recv``. ``split24`` (kernels/wire24.py) instead ships 3 bytes per element --
+    # a bf16 high half plus the next 8 mantissa bits -- so the leg's wire term drops 25 %,
+    # at the price of one pack pass per window on the send side and one unpack pass on the
+    # receive side. Both passes are INSIDE the timed region and inside the pipeline: the
+    # pack rides ``issue_input`` (one window ahead of the compute it precedes) and the
+    # unpack REPLACES the peer-major -> matrix-major transpose copy the full-width path
+    # already pays into ``gx``, so it is not an extra pass over that leg, only a wider one.
+    split24 = wire_in_codec == "split24"
+    recv = (
+        None if split24
+        else torch.empty(
+            (world, mine, rows, cols), dtype=stack.dtype, device=stack.device)
+    )
+    # Peer-major wire buffers for the split input leg. ``send_*`` exists only because a
+    # packed payload cannot be a view of the caller's fp32 tensor; it is the one staging
+    # buffer this encoding reintroduces, and it is 3 bytes/element rather than 4.
+    send_hi = send_lo = recv_hi = recv_lo = None
+    if split24:
+        shape24 = (world, mine, rows, cols)
+        send_hi = torch.empty(shape24, dtype=torch.bfloat16, device=stack.device)
+        send_lo = torch.empty(shape24, dtype=torch.uint8, device=stack.device)
+        recv_hi = torch.empty(shape24, dtype=torch.bfloat16, device=stack.device)
+        recv_lo = torch.empty(shape24, dtype=torch.uint8, device=stack.device)
     # Transport encoding of the OUTPUT leg only. ``stack.dtype`` (fp32) is the COMPUTE
     # dtype and never changes: ``gx`` stays fp32 so ``fused_ns._supported`` still holds and
     # the accepted fusion cannot silently un-bank, and ``result`` stays fp32 so the region
@@ -710,6 +765,45 @@ def _subgroup_pipelined(
         # Send peer d the block of matrices d owns, window [a, b): a contiguous view of
         # ``stack`` -- no packing copy. Receive from peer s that peer's shard of MY
         # matrices, window [a, b), landing peer-major in ``recv``.
+        if split24:
+            # Pack this window's peer blocks into the 3-byte wire pair, then exchange the
+            # two halves. Both halves ride the SAME batched p2p call (or the same pair of
+            # async all_to_alls), so the collective COUNT per window is unchanged in the
+            # batched case and the alpha term is not re-paid per half.
+            for d in (peers if elide_self else range(world)):
+                pack24(
+                    stack[d * mine + a : d * mine + b],
+                    send_hi[d, a:b],
+                    send_lo[d, a:b],
+                )
+            if elide_self:
+                if not peers:
+                    return []
+                ops = []
+                for s in peers:
+                    # Same order on both ranks -- NCCL matches p2p by issue order per peer
+                    # pair, so hi is received into hi and lo into lo.
+                    ops.append(torch.distributed.P2POp(
+                        torch.distributed.irecv, recv_hi[s, a:b], global_peer[s], tp_group))
+                    ops.append(torch.distributed.P2POp(
+                        torch.distributed.irecv, recv_lo[s, a:b], global_peer[s], tp_group))
+                    ops.append(torch.distributed.P2POp(
+                        torch.distributed.isend, send_hi[s, a:b], global_peer[s], tp_group))
+                    ops.append(torch.distributed.P2POp(
+                        torch.distributed.isend, send_lo[s, a:b], global_peer[s], tp_group))
+                return torch.distributed.batch_isend_irecv(ops)
+            return [
+                torch.distributed.all_to_all(
+                    [recv_hi[s, a:b] for s in range(world)],
+                    [send_hi[d, a:b] for d in range(world)],
+                    group=tp_group, async_op=True,
+                ),
+                torch.distributed.all_to_all(
+                    [recv_lo[s, a:b] for s in range(world)],
+                    [send_lo[d, a:b] for d in range(world)],
+                    group=tp_group, async_op=True,
+                ),
+            ]
         if elide_self:
             if not peers:
                 return []
@@ -765,7 +859,20 @@ def _subgroup_pipelined(
         # (peer, matrix, rows, cols) -> (matrix, peer * rows, cols): per matrix the shards
         # concatenated in RANK order, identical to duplicated's all_gather + cat(dim=0).
         gx_c = gx[:n]
-        if elide_self:
+        if split24:
+            # The unpack IS the transpose: it reads the peer-major wire pair and writes the
+            # matrix-major fp32 gather buffer directly, so it stands exactly where the
+            # full-width path's ``copy_`` stood. Under ``elide_self`` the self block is not
+            # on the wire, so it is copied at full width straight from ``stack`` and this
+            # rank's OWN shard is never degraded; without elision it travels (and so is
+            # encoded) exactly like every other block, which is what that arm means.
+            gx_v = gx_c.view(n, world, rows, cols)
+            for s in range(world):
+                if elide_self and s == rank:
+                    gx_v[:, s].copy_(stack[rank * mine + a : rank * mine + b])
+                else:
+                    unpack24(recv_hi[s, a:b], recv_lo[s, a:b], gx_v[:, s])
+        elif elide_self:
             # Same transpose, one peer slice at a time, with the self slice taken from
             # ``stack`` instead of from ``recv``. Same bytes copied, same RANK order.
             gx_v = gx_c.view(n, world, rows, cols)
@@ -931,10 +1038,20 @@ def newton_schulz_tp_subgroup(
             )
         if elide_self and world < 2:
             raise ValueError("self-block elision needs at least one real peer")
+        wire_out, wire_in_codec = (
+            SUBGROUP_WIRE_MODES[wire] if wire else (None, "")
+        )
+        if wire_in_codec == "split24" and not HAVE_WIRE24:
+            # Hard error, never a silent fp32 input leg: a fallback here would let the
+            # 24-bit arm be SCORED while running the full-width wire it exists to shrink.
+            raise RuntimeError(
+                "wire mode 'split24' input leg requested but kernels.wire24 is unavailable"
+            )
         return _subgroup_pipelined(
             stack, steps, coefficient_type, tp_group, use_syrk, fused, pipe_chunks,
             elide_self=elide_self,
-            wire_out=SUBGROUP_WIRE_MODES[wire] if wire else None,
+            wire_out=wire_out,
+            wire_in_codec=wire_in_codec,
         )
 
     my_sub = rank // subgroup_size           # s_r
@@ -2070,7 +2187,11 @@ def main() -> None:
              "/ SYRK path, same pipeline depth, same self-block treatment; the compute "
              "dtype and the returned dtype are untouched. BITWISE: the fused kernel holds "
              "X in bf16 across all five steps and widens only at its epilogue, so every "
-             "value on that wire is exactly bf16-representable. Empty by default, so "
+             "value on that wire is exactly bf16-representable. The '24in' modes ALSO "
+             "carry the INPUT leg as a 24-bit split (bf16 high half + the next 8 mantissa "
+             "bits, kernels/wire24.py): 3 bytes per element instead of 4, LOSSY at ~2^-16 "
+             "relative error, gated by the workload's equivalence gate rather than by a "
+             "bitwise argument. Empty by default, so "
              "without it the scored policy set is byte-identical to before; an unknown "
              "mode, a wire mode without --pipelined-exchange, or one on the unfused "
              "compute path is a hard ValueError, never a silent fp32 fallback.",
@@ -2308,6 +2429,15 @@ def main() -> None:
         assert config.dtype == "float32", (
             "--subgroup-wire-modes changes the TRANSPORT encoding of an fp32 region; it "
             f"is undefined at --dtype {config.dtype}."
+        )
+        needs24 = [
+            w for w in config.subgroup_wire_modes
+            if SUBGROUP_WIRE_MODES.get(w, (None, ""))[1] == "split24"
+        ]
+        assert not needs24 or HAVE_WIRE24, (
+            f"--subgroup-wire-modes {needs24} need the 24-bit split codec "
+            "(dist_muon_opt/kernels/wire24.py), which is unavailable here. Failing at "
+            "config time rather than silently scoring a full-width input leg."
         )
     if config.subgroup_batched:
         assert config.set_timing and subgroup_sizes, (

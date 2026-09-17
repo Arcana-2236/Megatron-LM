@@ -138,6 +138,25 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # pipeline turns out to absorb, because the widening is drained at a lag of two windows and
 # so overlaps the next window's exchange instead of trailing the last one.
 #
+# stage-5 phase-3 `egtp-wire-24bit-input-leg` adds `bf16out24in` as a FURTHER column of
+# the same region, timed in the SAME job over the SAME tensors under the SAME composition.
+# It keeps that bitwise output leg and additionally carries the INPUT leg -- the shard of
+# the un-orthogonalized matrix each rank ships to the owner, 2.013 of the 3.02 GB/rank/
+# region and the only leg still at full width -- as a 24-bit split: the bf16 high half of
+# each fp32 word plus the next 8 mantissa bits, in a bf16 buffer and a uint8 buffer riding
+# the same batched p2p call (dist_muon_opt/kernels/wire24.py). 3 bytes per element instead
+# of 4, i.e. -25 % on that leg and -16.7 % of the region's wire term.
+#
+# Unlike `bf16out` this one is LOSSY -- it clears the low 8 of fp32's 24 mantissa bits
+# after a round-to-nearest-even, ~2^-16 relative error -- so it is a TOLERANCE row gated by
+# the workload's atol = rtol = 1e-3, measured through the real 5-step chain by
+# dist_muon_opt/scripts/preflight_wire24.py rather than argued per entry. PLAIN bf16 on
+# this leg (8 mantissa bits) was refuted at 1.221e-3 in stage-4 phase-5; this keeps 8 more
+# bits, i.e. ~256x the headroom against the same gate. Compute precision is still
+# untouched: `gx` is fp32, `_supported` still holds, the fused chain cannot un-bank, and
+# the region still returns fp32 in INPUT order. The per-shape argmin sees both wire columns
+# and the un-wired reference, so if the split loses on time the banked `bf16out` stands.
+#
 # `bf16out` is therefore the DEFAULT here. Set EGTP_SUBGROUP_WIRE_MODES="" to score the
 # pre-phase-4 state, or to a longer mode list to re-open the argmin:
 #   sbatch --export=ALL,USE_SYRK=1,EGTP_SUBGROUP_WIRE_MODES="" \
@@ -167,7 +186,7 @@ options=" \
     --pipelined-exchange \
     --pipe-chunks ${EGTP_PIPE_CHUNKS:-4} \
     --elide-self-block \
-    --subgroup-wire-modes ${EGTP_SUBGROUP_WIRE_MODES-bf16out} \
+    --subgroup-wire-modes ${EGTP_SUBGROUP_WIRE_MODES-bf16out bf16out24in} \
     ${SYRK_OPTION} "
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
