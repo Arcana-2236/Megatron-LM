@@ -13,6 +13,7 @@ training code, and none of it runs in CI.
 | `run_dist_muon_bench.sh` | **Entry point.** Submits both axes, waits, reports one combined `TOTAL_STEP_MS`. | Slurm |
 | `kernels/fused_ns.py` | Fused fp32 prologue / bf16 epilogue around the batched NS chain. | `triton`, `emerging_optimizers` |
 | `kernels/wire24.py` | 24-bit split transport codec (bf16 high half + 8 mantissa bits). | `triton` |
+| `verification/` | The equivalence gate each accepted optimization passed, one `check_*.py` + `window_*.sbatch` per candidate. | Slurm, pyxis |
 
 ## Why both
 
@@ -44,14 +45,47 @@ logs, and padding agrees to within 0.2%.
 ## Requirements
 
 The Python side is self-contained -- `bench_ns_strategies.py` resolves `kernels/` from its
-own directory -- but the container must provide:
+own directory -- but the container must provide `torch` (CUDA), `triton` and
+`emerging_optimizers` (`newton_schulz`, `batched_tsyrk_ex`; asserted, not optional).
 
-| | why |
+Every number below was measured in the **NT4 pretraining image**:
+
+```
+gitlab-master.nvidia.com/xren/nemo_megatron_perf_optimization:mcore-moe-pytorch26.07fix-temain4adad4c2-hybridep94a9f8f6-ncclmemfix-cutedslgdpv0.3.0-arm
+```
+
+| | |
 |---|---|
-| `torch` (CUDA), `triton` | the NS chain and both Triton kernel modules |
-| `emerging_optimizers` | `newton_schulz`, `batched_tsyrk_ex`; asserted, not optional |
+| torch | `2.13.0a0+9186a08b2c.nvinternal.26.07.pin.mem.thresh` |
+| CUDA | 13.3 |
+| hardware | GB300, 4 GPUs/node, NV18 intra-node; 16 nodes for GTP=64 |
 
-Point the drivers at it with `IMAGE_PATH`; they fail loudly rather than run without it.
+The torch build is an internal one, so the image is the reproducible unit -- not a pip
+list. Point the drivers at it with `IMAGE_PATH`; they fail loudly rather than run without.
+
+## Verifying the optimizations
+
+`verification/` holds the gates each accepted optimization passed: a `check_*.py`
+comparing the candidate arm against the arm it replaces, plus a `window_*.sbatch` that
+runs it at the real parallel degree. The workload is `inference` mode, so the gate is
+`torch.allclose` equivalence at `atol = rtol = 1e-3`, not loss convergence.
+
+```bash
+sbatch tools/muon_analysis/verification/capture_reference.sbatch   # once: freeze phase-0 refs
+sbatch tools/muon_analysis/verification/window_wire24.sbatch       # then any gate
+```
+
+Outputs land in `${ROOT_DIR}/runs/verification/<phase>/`; override with `OUT_DIR`.
+
+The reference tensors are **not in git** -- 8.3 GB, and regenerable. `capture_reference.py`
+seeds **per shape**, `seed + crc32(f"{axis}_{m}x{n}") % 100000` with `--seed 1234`, and runs
+the capture twice at the identical seed to establish the output nondeterminism floor. The
+seed number alone does not reconstruct them; the derivation in that script does. Point a
+gate at an existing set with `REF_DIR`.
+
+Note the benchmark driver itself seeds nothing -- it is a pure latency benchmark over
+`torch.randn`, emitting no numerical output. What is frozen there is the *shape set*, which
+`bench_ns_strategies.py` hard-codes as constants.
 
 ## Running it from a fresh clone
 
