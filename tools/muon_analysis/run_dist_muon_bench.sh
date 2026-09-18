@@ -13,8 +13,10 @@
 # Usage: bash tools/muon_analysis/run_dist_muon_bench.sh
 # Can be invoked from anywhere; it resolves its own paths.
 #
-# Expect this to be SLOW end-to-end. The 16-node GTP job has been observed queuing
-# ~10h on gb300, and that wait is paid per attempt by design (see MAX_WAIT_SECONDS).
+# This BLOCKS: it polls until both axes finish, because it has to read both logs to
+# report one number. Run it detached on a busy partition. Observed so far on gb300:
+# queue waits of 0 and 16.5 min for the 16-node GTP axis, then ~16 min of runtime; the
+# ceiling below is a safety net, not a forecast.
 
 set -uo pipefail  # deliberately NOT -e: job failures are handled explicitly below.
 
@@ -30,8 +32,8 @@ GTP_LOG_DIR="${ROOT_DIR}/runs/ns_bench/gtp${TAG:+_$TAG}/logs"
 EGTP_LOG_DIR="${ROOT_DIR}/runs/ns_bench/egtp${TAG:+_$TAG}/logs"
 
 POLL_SECONDS=${POLL_SECONDS:-60}
-# Deep gb300 queue: a 16-node job was measured starting ~10h after submission, so a
-# short ceiling would abort healthy attempts. 24h by default.
+# Generous ceiling so a deep queue never aborts a healthy attempt; it is not a claim
+# about how long the wait actually is. 24h by default.
 MAX_WAIT_SECONDS=${MAX_WAIT_SECONDS:-86400}
 
 submitted_ids=()

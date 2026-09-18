@@ -18,25 +18,30 @@ MA_DIR="${REPO_DIR}/tools/muon_analysis"
 VERIF_DIR="${MA_DIR}/verification"
 # Frozen phase-0 reference tensors. Not in git (8.3 GB); regenerate with
 # capture_reference.sbatch, which seeds per shape from --seed (default 1234).
-REF_DIR="${REF_DIR:-${ROOT_DIR}/runs/verification/reference_outputs}"
+REF_DIR="${REF_DIR:-${ROOT_DIR}/runs/verification/reference_outputs_s6}"
 if [[ ! -f "${MA_DIR}/bench_ns_strategies.py" ]]; then
     echo "ERROR: no benchmark at ${MA_DIR}; set ROOT_DIR to the dir containing Megatron-LM" >&2
     exit 1
 fi
-WS="${ROOT_DIR}/dist_muon_opt"
-IMAGE_PATH="${ROOT_DIR}/images/training.sqsh"
-mkdir -p "${WS}/scripts/logs"
+# The container must provide torch, triton and emerging_optimizers; see ../README.md.
+IMAGE_PATH="${IMAGE_PATH:-${ROOT_DIR}/images/training.sqsh}"
+if [[ ! -e "${IMAGE_PATH}" ]]; then
+    echo "ERROR: container image not found at ${IMAGE_PATH}" >&2
+    exit 1
+fi
+LOGS_DIR="${REF_DIR}/logs"
+mkdir -p "${LOGS_DIR}"
 
 export MASTER_ADDR=$(scontrol show hostnames "${SLURM_JOB_NODELIST}" | head -n1)
 export MASTER_PORT=29513
 export NCCL_DEBUG=WARN
 
 run_cmd="export RANK=\${SLURM_PROCID} WORLD_SIZE=\${SLURM_NTASKS} LOCAL_RANK=\${SLURM_LOCALID}; \
-python -u ${WS}/scripts/capture_reference.py --out ${WS}/stage-5/reference_outputs_s6 --seed 1234 --passes 2"
+python -u ${VERIF_DIR}/capture_reference.py --out ${REF_DIR} --seed ${REF_SEED:-1234} --passes 2"
 
 srun -l --mpi=none \
     --container-image "${IMAGE_PATH}" \
     --container-mounts "/lustre:/lustre" \
     --no-container-mount-home \
-    --output="${WS}/scripts/logs/%x_%j.log" \
+    --output="${LOGS_DIR}/%x_%j.log" \
     bash -c "${run_cmd}"

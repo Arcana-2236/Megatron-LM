@@ -88,8 +88,7 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # math -- same 5 steps, same polar_express coefficients, same batched Triton SYRK path --
 # with the fp32 Frobenius-normalize + bf16 cast prologue and the bf16->fp32 cast + store
 # epilogue that wrap the chain collapsed into two Triton passes each. Measured composition
-# of the unfused region on this hardware (dist_muon_opt/stage-3/phase-2-egtp-ns-step-fusion,
-# job 2882597): of 34.7-37.7 ms of compute per region, 28.1 ms is the GEMM chain, 6.6 ms is
+# of the unfused region on this hardware (job 2882597): of 34.7-37.7 ms of compute per region, 28.1 ms is the GEMM chain, 6.6 ms is
 # exactly those prologue/epilogue passes, and the tall shape pays a further ~3.0 ms because
 # its store is strided. Both arms come from THIS one job over the SAME tensors under the
 # SAME composition.
@@ -117,8 +116,7 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # the way in, into `result` on the way out. Both of those buffers were going to be written
 # by the transpose the pipelined path already pays, so no HBM traffic is added; what is
 # removed is the round trip of the own block through `recv`/`sendout`. The measured
-# transport probe (job 2892006, dist_muon_opt/stage-4/phase-1-egtp-selfblock-elide/
-# transport_probe.json) shows the self block was NOT on the wire at the region's real
+# transport probe (job 2892006) shows the self block was NOT on the wire at the region's real
 # payload (all_to_all_single 3.611 ms vs peer-only p2p 3.594 ms, ratio 1.005 against 2.0 if
 # it had been), so the win is the staging round trip, not wire bytes. The same job's
 # real-arm window at the region's real count of 192 measured -4.328 ms (5120x2048) and
@@ -169,7 +167,7 @@ if [[ "${USE_SYRK:-0}" == "1" ]]; then SYRK_OPTION="--use-syrk"; fi
 # Unlike `bf16out` this one is LOSSY -- it clears the low 8 of fp32's 24 mantissa bits
 # after a round-to-nearest-even, ~2^-16 relative error -- so it is a TOLERANCE row gated by
 # the workload's atol = rtol = 1e-3, measured through the real 5-step chain by
-# dist_muon_opt/scripts/preflight_wire24.py rather than argued per entry. PLAIN bf16 on
+# verification/check_wire24.py rather than argued per entry. PLAIN bf16 on
 # this leg (8 mantissa bits) was refuted at 1.221e-3 in stage-4 phase-5; this keeps 8 more
 # bits, i.e. ~256x the headroom against the same gate. Compute precision is still
 # untouched: `gx` is fp32, `_supported` still holds, the fused chain cannot un-bank, and
