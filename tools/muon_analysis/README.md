@@ -79,30 +79,6 @@ That is a real run of this tree (jobs 3100651 / 3100652, 16:00 and 7:48) against
 On different hardware the per-shape argmin will legitimately select differently and land
 elsewhere; that is the benchmark working, not a regression.
 
-## Verifying the optimizations
-
-`verification/` holds the gates the accepted optimizations passed: 14 `check_*.py`, each
-comparing a candidate arm against the arm it replaces, and 13 `window_*.sbatch` that run
-them at the real parallel degree. The workload is `inference` mode, so the gate is
-`torch.allclose` equivalence at `atol = rtol = 1e-3`, not loss convergence.
-
-```bash
-sbatch tools/muon_analysis/verification/capture_reference.sbatch   # once: 1 node, ~20 min
-sbatch tools/muon_analysis/verification/window_wire24.sbatch       # then any gate
-```
-
-Outputs land in `${ROOT_DIR}/runs/verification/<phase>/`; override with `OUT_DIR`.
-
-The reference tensors are **not in git** -- 8.3 GB, and regenerable. `capture_reference.py`
-seeds **per shape**, `seed + crc32(f"{axis}_{m}x{n}") % 100000` with `--seed 1234`, and runs
-the capture twice at the identical seed to establish the output nondeterminism floor. The
-seed number alone does not reconstruct them; the derivation in that script does. Point a
-gate at an existing set with `REF_DIR`.
-
-Note the benchmark driver itself seeds nothing -- it is a pure latency benchmark over
-`torch.randn`, emitting no numerical output. What is frozen there is the *shape set*, which
-`bench_ns_strategies.py` hard-codes as constants.
-
 ## Benchmarking Newton-Schulz
 
 The world size must equal the sharding degree being modelled, so the two axes need
@@ -140,15 +116,15 @@ reported step cost is the max over rank profiles, not the mean.
 Newton-Schulz time per optimizer step, per GPU: the slowest rank profile on each axis, so
 the total assumes a GPU drawing the worst profile on both.
 
-Out of the box on the plain GEMM path the same configuration costs **~1.3 s** per step.
-Everything below forces `--use-syrk`, the path this workload is locked to, which is where
-the **1112.678 ms** starting point comes from.
+**Every number in this table is `--use-syrk`**, the path this workload is locked to.
 
 | | Phase-0 | now | speedup |
 |---|---:|---:|---:|
 | **GTP** (dense, 64-rank NVLink) | 622.051 | **46.342** | **13.4x** |
 | **EGTP** (expert, 2-rank network) | 475.315 | **91.125** | **5.2x** |
 | **total** | 1112.678 | **137.467** | **8.09x** |
+
+Without `--use-syrk` the original baseline is **1390 ms**.
 
 The accept commits on this branch are that trajectory, one optimization each, with the
 measured delta, equivalence result and job ids in every message. The short version:
