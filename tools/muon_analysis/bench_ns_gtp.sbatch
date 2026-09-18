@@ -15,7 +15,7 @@
 #SBATCH --account=coreai_dlalgo_llm
 #SBATCH --nodes=16
 #SBATCH --exclusive
-#SBATCH -t 00:45:00
+#SBATCH -t 00:25:00
 #SBATCH --mem=0
 # No --gpus-per-node: Lyris rejects it as an invalid gres spec. --exclusive gives all
 # 4 GPUs on the node.
