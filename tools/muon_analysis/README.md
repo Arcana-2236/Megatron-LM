@@ -1,46 +1,23 @@
-# Muon / LayerWise optimizer analysis tools
+# Muon / LayerWise Newton-Schulz analysis tools
 
-Standalone tools for reasoning about `LayerWiseDistributedOptimizer` (Muon) memory and
+Standalone tools for measuring and optimizing `LayerWiseDistributedOptimizer` (Muon)
 Newton-Schulz performance on real model configurations. Nothing here is imported by
 training code, and none of it runs in CI.
 
+The benchmark models one dist_muon optimizer step on Nemotron-3 Ultra at 128 GPUs, split
+across the two axes a rank really pays: the dense weights over GTP=64, and the expert
+weights over EGTP=2. The branch history is an optimization of that step from 1112.678 ms
+to 137.467 ms, one accepted candidate per commit.
+
 | file | what it answers | needs |
 |---|---|---|
-| `padding_estimate.py` | How much of the optimizer's buffers is shard-imbalance padding, per buffer and per GPU count? | stdlib only |
 | `bench_ns_strategies.py` | Which Newton-Schulz distribution strategy is fastest for the shapes a rank actually owns? | GPUs, `torch`, `emerging_optimizers` |
 | `bench_ns_egtp.sbatch` | Runs the benchmark over the EGTP axis on one node, NVLink disabled. | Slurm, pyxis |
 | `bench_ns_gtp.sbatch` | Runs the benchmark over the GTP axis, 16 nodes for GTP=64. | Slurm, pyxis |
 | `run_dist_muon_bench.sh` | **Entry point.** Submits both axes, waits, reports one combined `TOTAL_STEP_MS`. | Slurm |
 | `kernels/fused_ns.py` | Fused fp32 prologue / bf16 epilogue around the batched NS chain. | `triton`, `emerging_optimizers` |
 | `kernels/wire24.py` | 24-bit split transport codec (bf16 high half + 8 mantissa bits). | `triton` |
-| `verification/` | The equivalence gate each accepted optimization passed, one `check_*.py` + `window_*.sbatch` per candidate. | Slurm, pyxis |
-
-## Why both
-
-They answer the two halves of the same question. The layer-wise optimizer assigns whole
-matrices to data-parallel shards, so a rank's cost depends on *which* matrices it drew.
-`padding_estimate.py` models the memory consequence of that assignment; `bench_ns_strategies.py`
-measures the time consequence. Both derive their shapes from the same model description
-and the same compute-balanced assignment, so their rank profiles line up.
-
-## Estimating padding
-
-Pure arithmetic, so it runs anywhere:
-
-```bash
-python tools/muon_analysis/padding_estimate.py \
-    --hybrid-layer-pattern 'MEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEM*EMEMEMEM*EMEMEMEME/*E/*E' \
-    --hidden-size 2688 --ffn-hidden-size 3712 --moe-latent-size 672 \
-    --num-experts 256 --moe-shared-expert-intermediate-size 3712 \
-    --kv-channels 192 --num-attention-heads 32 --num-query-groups 1 \
-    --mamba-num-heads 16 --mamba-num-groups 16 \
-    --mtp-num-layers 2 --mtp-use-repeated-layer \
-    --world-size 512 --expert-model-parallel-size 64 \
-    --ddp-num-buckets 8 --total-params-per-rank 2846797792
-```
-
-Validated against a real 512-GPU run: bucket count and `dp_size` match the layout Megatron
-logs, and padding agrees to within 0.2%.
+| `verification/` | The equivalence gates the accepted optimizations passed: 14 `check_*.py` + 13 `window_*.sbatch`. | Slurm, pyxis |
 
 ## Requirements
 
@@ -63,30 +40,6 @@ gitlab-master.nvidia.com/xren/nemo_megatron_perf_optimization:mcore-moe-pytorch2
 The torch build is an internal one, so the image is the reproducible unit -- not a pip
 list. Point the drivers at it with `IMAGE_PATH`; they fail loudly rather than run without.
 
-## Verifying the optimizations
-
-`verification/` holds the gates each accepted optimization passed: a `check_*.py`
-comparing the candidate arm against the arm it replaces, plus a `window_*.sbatch` that
-runs it at the real parallel degree. The workload is `inference` mode, so the gate is
-`torch.allclose` equivalence at `atol = rtol = 1e-3`, not loss convergence.
-
-```bash
-sbatch tools/muon_analysis/verification/capture_reference.sbatch   # once: freeze phase-0 refs
-sbatch tools/muon_analysis/verification/window_wire24.sbatch       # then any gate
-```
-
-Outputs land in `${ROOT_DIR}/runs/verification/<phase>/`; override with `OUT_DIR`.
-
-The reference tensors are **not in git** -- 8.3 GB, and regenerable. `capture_reference.py`
-seeds **per shape**, `seed + crc32(f"{axis}_{m}x{n}") % 100000` with `--seed 1234`, and runs
-the capture twice at the identical seed to establish the output nondeterminism floor. The
-seed number alone does not reconstruct them; the derivation in that script does. Point a
-gate at an existing set with `REF_DIR`.
-
-Note the benchmark driver itself seeds nothing -- it is a pure latency benchmark over
-`torch.randn`, emitting no numerical output. What is frozen there is the *shape set*, which
-`bench_ns_strategies.py` hard-codes as constants.
-
 ## Running it from a fresh clone
 
 Nothing is hardcoded to a site, but three things are cluster-specific and must be supplied:
@@ -108,6 +61,47 @@ sbatch -p <partition> --account=<account> \
 
 `--segment=16` in the GTP driver is topology-specific; drop it on clusters without
 segments. GTP degree and node count must agree: `nodes * GPUs_per_node == GTP`.
+
+**The wrapper blocks** -- it submits both axes and polls until they finish (up to 24 h by
+default, `MAX_WAIT_SECONDS`), because it has to read both logs to report one number. On a
+busy partition run it detached. It cancels its jobs on SIGINT/SIGTERM.
+
+### What you should see
+
+```
+[run_dist_muon_bench] gtp  fastest step: 46.158 ms (per_shape_fuse_sub_set)
+[run_dist_muon_bench] egtp fastest step: 91.130 ms (per_shape_batch_sub_wire_set)
+[run_dist_muon_bench] TOTAL_STEP_MS=137.288
+```
+
+That is a real run of this tree (jobs 3100651 / 3100652, 16:00 and 7:48) against the
+137.467 ms recorded in the table below -- 0.13% apart, both axes selecting the same arms.
+On different hardware the per-shape argmin will legitimately select differently and land
+elsewhere; that is the benchmark working, not a regression.
+
+## Verifying the optimizations
+
+`verification/` holds the gates the accepted optimizations passed: 14 `check_*.py`, each
+comparing a candidate arm against the arm it replaces, and 13 `window_*.sbatch` that run
+them at the real parallel degree. The workload is `inference` mode, so the gate is
+`torch.allclose` equivalence at `atol = rtol = 1e-3`, not loss convergence.
+
+```bash
+sbatch tools/muon_analysis/verification/capture_reference.sbatch   # once: 1 node, ~20 min
+sbatch tools/muon_analysis/verification/window_wire24.sbatch       # then any gate
+```
+
+Outputs land in `${ROOT_DIR}/runs/verification/<phase>/`; override with `OUT_DIR`.
+
+The reference tensors are **not in git** -- 8.3 GB, and regenerable. `capture_reference.py`
+seeds **per shape**, `seed + crc32(f"{axis}_{m}x{n}") % 100000` with `--seed 1234`, and runs
+the capture twice at the identical seed to establish the output nondeterminism floor. The
+seed number alone does not reconstruct them; the derivation in that script does. Point a
+gate at an existing set with `REF_DIR`.
+
+Note the benchmark driver itself seeds nothing -- it is a pure latency benchmark over
+`torch.randn`, emitting no numerical output. What is frozen there is the *shape set*, which
+`bench_ns_strategies.py` hard-codes as constants.
 
 ## Benchmarking Newton-Schulz
 
@@ -180,11 +174,11 @@ row-splits a matrix inside its subgroup; `_pipeN` runs the exchange as `N` async
 
 ## Drift warning
 
-Both tools reimplement `LayerWiseDistributedOptimizer._compute_per_buffer_param_layout`
-rather than importing it, which is what keeps `padding_estimate.py` dependency-free. They
-will go stale if that function changes. Re-check against the reference numbers in
-`padding_estimate.py`'s module docstring after touching the packer.
+`bench_ns_strategies.py` reimplements `LayerWiseDistributedOptimizer`'s per-buffer param
+layout rather than importing it, so it will go stale if that changes. `owned_matrices`
+mirrors `_emit_bucket`'s ordering, and its own docstring notes that bucketing is
+deliberately ignored: that changes which matrices land together, not the set of shapes.
 
-The model description in both files is a 54-layer hybrid Mamba-MoE and is fixed. Other
-models need the constants updated; `padding_estimate.py` takes them as flags, while
-`bench_ns_strategies.py` has them as module constants.
+The model description is a 54-layer hybrid Mamba-MoE and is fixed -- "these constants
+DEFINE the benchmark". Other models need those module constants updated; there are no
+flags for them.
