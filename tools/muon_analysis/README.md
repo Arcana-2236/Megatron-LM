@@ -8,8 +8,11 @@ training code, and none of it runs in CI.
 |---|---|---|
 | `padding_estimate.py` | How much of the optimizer's buffers is shard-imbalance padding, per buffer and per GPU count? | stdlib only |
 | `bench_ns_strategies.py` | Which Newton-Schulz distribution strategy is fastest for the shapes a rank actually owns? | GPUs, `torch`, `emerging_optimizers` |
-| `bench_ns_egtp.sbatch` | Runs the benchmark over the EGTP axis on one node, NVLink disabled. | Slurm, aws-cmh |
-| `bench_ns_gtp.sbatch` | Runs the benchmark over the GTP axis, 16 nodes for GTP=64. | Slurm, aws-cmh |
+| `bench_ns_egtp.sbatch` | Runs the benchmark over the EGTP axis on one node, NVLink disabled. | Slurm, pyxis |
+| `bench_ns_gtp.sbatch` | Runs the benchmark over the GTP axis, 16 nodes for GTP=64. | Slurm, pyxis |
+| `run_dist_muon_bench.sh` | **Entry point.** Submits both axes, waits, reports one combined `TOTAL_STEP_MS`. | Slurm |
+| `kernels/fused_ns.py` | Fused fp32 prologue / bf16 epilogue around the batched NS chain. | `triton`, `emerging_optimizers` |
+| `kernels/wire24.py` | 24-bit split transport codec (bf16 high half + 8 mantissa bits). | `triton` |
 
 ## Why both
 
@@ -38,13 +41,47 @@ python tools/muon_analysis/padding_estimate.py \
 Validated against a real 512-GPU run: bucket count and `dp_size` match the layout Megatron
 logs, and padding agrees to within 0.2%.
 
+## Requirements
+
+The Python side is self-contained -- `bench_ns_strategies.py` resolves `kernels/` from its
+own directory -- but the container must provide:
+
+| | why |
+|---|---|
+| `torch` (CUDA), `triton` | the NS chain and both Triton kernel modules |
+| `emerging_optimizers` | `newton_schulz`, `batched_tsyrk_ex`; asserted, not optional |
+
+Point the drivers at it with `IMAGE_PATH`; they fail loudly rather than run without it.
+
+## Running it from a fresh clone
+
+Nothing is hardcoded to a site, but three things are cluster-specific and must be supplied:
+
+```bash
+# 1. ROOT_DIR   -- the directory CONTAINING the checkout; runs/ is written under it.
+#                 Defaults to the parent of wherever sbatch was invoked, which is right
+#                 when you submit from the repo root. Otherwise pass it explicitly.
+# 2. IMAGE_PATH -- the container described above.
+# 3. partition / account -- override on the sbatch command line.
+
+bash tools/muon_analysis/run_dist_muon_bench.sh          # both axes, one TOTAL_STEP_MS
+
+# or one axis at a time, with the site settings spelled out:
+sbatch -p <partition> --account=<account> \
+       --export=ALL,USE_SYRK=1,ROOT_DIR=/path/containing/Megatron-LM,IMAGE_PATH=/path/img.sqsh \
+       tools/muon_analysis/bench_ns_gtp.sbatch
+```
+
+`--segment=16` in the GTP driver is topology-specific; drop it on clusters without
+segments. GTP degree and node count must agree: `nodes * GPUs_per_node == GTP`.
+
 ## Benchmarking Newton-Schulz
 
 The world size must equal the sharding degree being modelled, so the two axes need
 different allocations:
 
 ```bash
-sbatch tools/muon_analysis/bench_ns_egtp.sbatch                       # EGTP=4,  1 node
+sbatch tools/muon_analysis/bench_ns_egtp.sbatch                       # EGTP=2,  1 node
 sbatch tools/muon_analysis/bench_ns_gtp.sbatch                        # GTP=64, 16 nodes
 sbatch --nodes=2 --export=ALL,GTP=8 tools/muon_analysis/bench_ns_gtp.sbatch   # smaller trial
 ```
@@ -69,22 +106,43 @@ worth keeping straight:
 Every rank orthogonalizes concurrently and the step ends when the slowest finishes, so the
 reported step cost is the max over rank profiles, not the mean.
 
-## Measured on GB300 (16 NS steps, bf16 GEMMs)
+## Measured on GB300 -- Nemotron-3 Ultra, 128 GPUs
 
-Newton-Schulz time per optimizer step, per GPU. Each figure is the slowest rank profile
-for that buffer, so the total assumes a GPU drawing the worst profile on both axes.
+`GTP=64 / EP=64 / EGTP=2`, 5 NS steps, `polar_express`, `--use-syrk`, bf16 GEMMs.
+Newton-Schulz time per optimizer step, per GPU: the slowest rank profile on each axis, so
+the total assumes a GPU drawing the worst profile on both.
 
-| mode | dense (GTP=64, NVLink) | expert (EGTP=4, network) | total |
-|---|---|---|---|
-| `duplicated` | 123.6 ms | 141.0 ms | **264.6 ms** |
-| `distributed` | 223.8 ms | 1990.8 ms | 2214.6 ms |
+Out of the box on the plain GEMM path the same configuration costs **~1.3 s** per step.
+Everything below forces `--use-syrk`, the path this workload is locked to, which is where
+the **1112.678 ms** starting point comes from.
 
-`duplicated` wins on both axes despite paying exactly `group_size` redundancy, because
-`distributed`'s replicated `A @ A` term does not shrink with the group. Whenever the
-sharded dimension is the shorter one, Newton-Schulz runs along the long dimension instead
-and that term explodes: redundancy reaches 104x and 312x on some dense shapes, and 22x on
-the expert `3072x10240`. This is a compute problem, not a communication one, so a faster
-interconnect does not fix it.
+| | Phase-0 | now | speedup |
+|---|---:|---:|---:|
+| **GTP** (dense, 64-rank NVLink) | 622.051 | **46.342** | **13.4x** |
+| **EGTP** (expert, 2-rank network) | 475.315 | **91.125** | **5.2x** |
+| **total** | 1112.678 | **137.467** | **8.09x** |
+
+The accept commits on this branch are that trajectory, one optimization each, with the
+measured delta, equivalence result and job ids in every message. The short version:
+
+| what changed | Delta ms |
+|---|---:|
+| per-shape mode selection instead of one mode everywhere | -138 |
+| **stop recomputing the same matrix on every rank** (subgroup duplication, owner-computes, batched experts) | **-619** |
+| fuse and pipeline the exchanges (one a2a pair per region, async windows) | -117 |
+| shave staging copies and wire bytes (bf16 output leg, self-block elision, 24-bit input leg) | -35 |
+| push the duplication factor `g` to its floor, split inside the subgroup | -40 |
+
+### Mode vocabulary
+
+`duplicated_sub_g<N>` splits the group into `world/N` subgroups that each own a disjoint
+set of matrices and duplicate `N` ways inside: `g = world` is `duplicated`, `g = 1` is
+owner-computes. `_bal` pools the ownership deal across shapes by greedy LPT instead of
+dealing each shape independently -- a shape with 3 matrices dealt over 16 subgroups
+otherwise strands 13 of them and still costs one whole matrix. `_dist` additionally
+row-splits a matrix inside its subgroup; `_pipeN` runs the exchange as `N` async windows;
+`_wbf16out` / `_wbf16out24in` are the wire codecs (output leg bitwise, input leg lossy at
+~2^-16 and gated on the workload's 1e-3 tolerance).
 
 ## Drift warning
 

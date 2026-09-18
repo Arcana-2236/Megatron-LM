@@ -28,9 +28,28 @@ export NCCL_DEBUG=WARN
 
 GTP=${GTP:-64}
 
-ROOT_DIR="/lustre/fsw/coreai_dlalgo_llm/zhengywang/dist_muon_proxy_ootb"
+# ROOT_DIR is the directory CONTAINING the Megatron-LM checkout; run logs land in
+# ${ROOT_DIR}/runs/. It defaults to the parent of wherever sbatch was invoked, which is
+# correct when the job is submitted from the repo root -- what run_dist_muon_bench.sh
+# does. Any other layout must say so explicitly:
+#   sbatch --export=ALL,ROOT_DIR=/path/that/contains/Megatron-LM tools/muon_analysis/...
+# It is deliberately NOT a hardcoded absolute path: one clone writing into another
+# clone's runs/ directory is silent, and the wrapper then parses the wrong log.
+ROOT_DIR="${ROOT_DIR:-$(cd "${SLURM_SUBMIT_DIR:-${PWD}}/.." && pwd)}"
 REPO_DIR="${ROOT_DIR}/Megatron-LM"
+if [[ ! -f "${REPO_DIR}/tools/muon_analysis/bench_ns_strategies.py" ]]; then
+    echo "ERROR: no benchmark at ${REPO_DIR}/tools/muon_analysis/bench_ns_strategies.py" >&2
+    echo "  ROOT_DIR=${ROOT_DIR} -- set it to the directory containing your checkout" >&2
+    exit 1
+fi
+
+# The container must provide torch, triton and emerging_optimizers; see README.md.
 IMAGE_PATH="${IMAGE_PATH:-${ROOT_DIR}/images/training.sqsh}"
+if [[ ! -e "${IMAGE_PATH}" ]]; then
+    echo "ERROR: container image not found at ${IMAGE_PATH}" >&2
+    echo "  set IMAGE_PATH to an image providing torch + triton + emerging_optimizers" >&2
+    exit 1
+fi
 
 # TAG separates runs on different hardware, e.g. sbatch -p gb200 --export=ALL,TAG=gb200
 NAME="runs/ns_bench/gtp${TAG:+_$TAG}"
